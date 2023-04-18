@@ -30,470 +30,1200 @@
 
 #include "bentley_ottmann.h"
 #include "core/math/rect2.h"
+#include "thirdparty/misc/r128.h"
 
-static void bigint28_from_r128(R128_U64 out[5], R128 in) {
-	out[0] = in.lo & 0xFFFFFFF;
-	out[1] = (in.lo >> 28) & 0xFFFFFFF;
-	out[2] = (in.lo >> 56) | ((in.hi << 8) & 0xFFFFFFF);
-	out[3] = (in.hi >> 20) & 0xFFFFFFF;
-	out[4] = in.hi >> 48;
+/**
+ * Big integers by embedding 28 bit "digits" into 32 bit integer arrays.
+ * 28 bits ensures that multiplying any two "digits" keeps the result under
+ * 64 bits, with 8 bits of room left to spare.
+ */
+
+template <uint32_t digits>
+static void bigint28_from_r128(int32_t r_out[digits], R128 p_in);
+
+template <>
+static void bigint28_from_r128<5>(int32_t r_out[5], R128 p_in) {
+	r_out[0] = static_cast<int32_t>(p_in.lo & 0xFFFFFFF);
+	r_out[1] = static_cast<int32_t>((p_in.lo >> 28) & 0xFFFFFFF);
+	r_out[2] = static_cast<int32_t>((p_in.lo >> 56) | ((p_in.hi << 8) & 0xFFFFFFF));
+	r_out[3] = static_cast<int32_t>((p_in.hi >> 20) & 0xFFFFFFF);
+	r_out[4] = static_cast<int32_t>(p_in.hi >> 32) >> 16;
 }
 
-static void bigint28_to_r128(R128 &out, R128_U64 in[5]) {
-	out = R128(in[0] | (in[1] << 28) | (in[2] << 56), (in[2] >> 8) | (in[3] << 20) | (in[4] << 48));
+template <uint32_t digits>
+static R128 bigint28_to_r128(const int32_t p_in[digits]);
+
+template <>
+static R128 bigint28_to_r128<5>(const int32_t p_in[5]) {
+	return R128(static_cast<R128_U64>(p_in[0]) | (static_cast<R128_U64>(p_in[1]) << 28) | (static_cast<R128_U64>(p_in[2]) << 56), (static_cast<R128_U64>(p_in[2]) >> 8) | (static_cast<R128_U64>(p_in[3]) << 20) | (static_cast<R128_U64>(p_in[4]) << 48));
 }
 
-static void bigint28_mul_10(R128_U64 out[10], R128_U64 in1[10], R128_U64 in2[5]) {
-	out[0] = in1[0] * in2[0];
-	out[1] = in1[1] * in2[0] + in1[0] * in2[1] + (out[0] >> 28);
-	out[2] = in1[2] * in2[0] + in1[1] * in2[1] + in1[0] * in2[2] + (out[1] >> 28);
-	out[3] = in1[3] * in2[0] + in1[2] * in2[1] + in1[1] * in2[2] + in1[0] * in2[3] + (out[2] >> 28);
-	out[4] = in1[4] * in2[0] + in1[3] * in2[1] + in1[2] * in2[2] + in1[1] * in2[3] + in1[0] * in2[4] + (out[3] >> 28);
-	out[5] = in1[5] * in2[0] + in1[4] * in2[1] + in1[3] * in2[2] + in1[2] * in2[3] + in1[1] * in2[4] + (out[4] >> 28);
-	out[6] = in1[6] * in2[0] + in1[5] * in2[1] + in1[4] * in2[2] + in1[3] * in2[3] + in1[2] * in2[4] + (out[5] >> 28);
-	out[7] = in1[7] * in2[0] + in1[6] * in2[1] + in1[5] * in2[2] + in1[4] * in2[3] + in1[3] * in2[4] + (out[6] >> 28);
-	out[8] = in1[8] * in2[0] + in1[7] * in2[1] + in1[6] * in2[2] + in1[5] * in2[3] + in1[4] * in2[4] + (out[7] >> 28);
-	out[9] = in1[9] * in2[0] + (out[8] >> 28);
-	out[0] &= 0xFFFFFFF;
-	out[1] &= 0xFFFFFFF;
-	out[2] &= 0xFFFFFFF;
-	out[3] &= 0xFFFFFFF;
-	out[4] &= 0xFFFFFFF;
-	out[5] &= 0xFFFFFFF;
-	out[6] &= 0xFFFFFFF;
-	out[7] &= 0xFFFFFFF;
-	out[8] &= 0xFFFFFFF;
+template <>
+static R128 bigint28_to_r128<10>(const int32_t p_in[10]) {
+	DEV_ASSERT((p_in[5] == 0 && p_in[6] == 0 && p_in[7] == 0 && p_in[8] == 0 && p_in[9] == 0) || (p_in[5] == 0xFFFFFFF && p_in[6] == 0xFFFFFFF && p_in[7] == 0xFFFFFFF && p_in[8] == 0xFFFFFFF && p_in[9] == -1));
+	return R128(static_cast<R128_U64>(p_in[0]) | (static_cast<R128_U64>(p_in[1]) << 28) | (static_cast<R128_U64>(p_in[2]) << 56), (static_cast<R128_U64>(p_in[2]) >> 8) | (static_cast<R128_U64>(p_in[3]) << 20) | (static_cast<R128_U64>(p_in[4]) << 48));
 }
 
-static void bigint28_mul(R128_U64 out[10], R128_U64 in1[5], R128_U64 in2[5]) {
-	out[0] = in1[0] * in2[0];
-	out[1] = in1[1] * in2[0] + in1[0] * in2[1] + (out[0] >> 28);
-	out[2] = in1[2] * in2[0] + in1[1] * in2[1] + in1[0] * in2[2] + (out[1] >> 28);
-	out[3] = in1[3] * in2[0] + in1[2] * in2[1] + in1[1] * in2[2] + in1[0] * in2[3] + (out[2] >> 28);
-	out[4] = in1[4] * in2[0] + in1[3] * in2[1] + in1[2] * in2[2] + in1[1] * in2[3] + in1[0] * in2[4] + (out[3] >> 28);
-	out[5] = in1[4] * in2[1] + in1[3] * in2[2] + in1[2] * in2[3] + in1[1] * in2[4] + (out[4] >> 28);
-	out[6] = in1[4] * in2[2] + in1[3] * in2[3] + in1[2] * in2[4] + (out[5] >> 28);
-	out[7] = in1[4] * in2[3] + in1[3] * in2[4] + (out[6] >> 28);
-	out[8] = in1[4] * in2[4] + (out[7] >> 28);
-	out[9] = (out[8] >> 28);
-	out[0] &= 0xFFFFFFF;
-	out[1] &= 0xFFFFFFF;
-	out[2] &= 0xFFFFFFF;
-	out[3] &= 0xFFFFFFF;
-	out[4] &= 0xFFFFFFF;
-	out[5] &= 0xFFFFFFF;
-	out[6] &= 0xFFFFFFF;
-	out[7] &= 0xFFFFFFF;
-	out[8] &= 0xFFFFFFF;
+template <>
+static R128 bigint28_to_r128<15>(const int32_t p_in[15]) {
+	DEV_ASSERT((p_in[5] == 0 && p_in[6] == 0 && p_in[7] == 0 && p_in[8] == 0 && p_in[9] == 0 && p_in[10] == 0 && p_in[11] == 0 && p_in[12] == 0 && p_in[13] == 0 && p_in[14] == 0) || (p_in[5] == 0xFFFFFFF && p_in[6] == 0xFFFFFFF && p_in[7] == 0xFFFFFFF && p_in[8] == 0xFFFFFFF && p_in[9] == 0xFFFFFFF && p_in[10] == 0xFFFFFFF && p_in[11] == 0xFFFFFFF && p_in[12] == 0xFFFFFFF && p_in[13] == 0xFFFFFFF && p_in[14] == -1));
+	return R128(static_cast<R128_U64>(p_in[0]) | (static_cast<R128_U64>(p_in[1]) << 28) | (static_cast<R128_U64>(p_in[2]) << 56), (static_cast<R128_U64>(p_in[2]) >> 8) | (static_cast<R128_U64>(p_in[3]) << 20) | (static_cast<R128_U64>(p_in[4]) << 48));
 }
 
-static void bigint28_add_10(R128_U64 out[10], R128_U64 in[10]) {
-	out[0] += in[0];
-	out[1] += in[1] + (out[0] >> 28);
-	out[2] += in[2] + (out[1] >> 28);
-	out[3] += in[3] + (out[2] >> 28);
-	out[4] += in[4] + (out[3] >> 28);
-	out[5] += in[5] + (out[4] >> 28);
-	out[6] += in[6] + (out[5] >> 28);
-	out[7] += in[7] + (out[6] >> 28);
-	out[8] += in[8] + (out[7] >> 28);
-	out[9] += in[9] + (out[8] >> 28);
-	out[0] &= 0xFFFFFFF;
-	out[1] &= 0xFFFFFFF;
-	out[2] &= 0xFFFFFFF;
-	out[3] &= 0xFFFFFFF;
-	out[4] &= 0xFFFFFFF;
-	out[5] &= 0xFFFFFFF;
-	out[6] &= 0xFFFFFFF;
-	out[7] &= 0xFFFFFFF;
-	out[8] &= 0xFFFFFFF;
-}
-
-static void bigint28_sub_10(R128_U64 out[10], R128_U64 in[10]) {
-	out[0] -= in[0];
-	out[1] -= in[1] + ((out[0] >> 28) & 1);
-	out[2] -= in[2] + ((out[1] >> 28) & 1);
-	out[3] -= in[3] + ((out[2] >> 28) & 1);
-	out[4] -= in[4] + ((out[3] >> 28) & 1);
-	out[5] -= in[5] + ((out[4] >> 28) & 1);
-	out[6] -= in[6] + ((out[5] >> 28) & 1);
-	out[7] -= in[7] + ((out[6] >> 28) & 1);
-	out[8] -= in[8] + ((out[7] >> 28) & 1);
-	out[9] -= in[9] + ((out[8] >> 28) & 1);
-	out[0] &= 0xFFFFFFF;
-	out[1] &= 0xFFFFFFF;
-	out[2] &= 0xFFFFFFF;
-	out[3] &= 0xFFFFFFF;
-	out[4] &= 0xFFFFFFF;
-	out[5] &= 0xFFFFFFF;
-	out[6] &= 0xFFFFFFF;
-	out[7] &= 0xFFFFFFF;
-	out[8] &= 0xFFFFFFF;
-}
-
-static void bigint28_sub(R128_U64 out[10], R128_U64 in[5]) {
-	out[0] -= in[0];
-	out[1] -= in[1] + ((out[0] >> 28) & 1);
-	out[2] -= in[2] + ((out[1] >> 28) & 1);
-	out[3] -= in[3] + ((out[2] >> 28) & 1);
-	out[4] -= in[4] + ((out[3] >> 28) & 1);
-	out[5] -= ((out[4] >> 28) & 1);
-	out[6] -= ((out[5] >> 28) & 1);
-	out[7] -= ((out[6] >> 28) & 1);
-	out[8] -= ((out[7] >> 28) & 1);
-	out[9] -= ((out[8] >> 28) & 1);
-	out[0] &= 0xFFFFFFF;
-	out[1] &= 0xFFFFFFF;
-	out[2] &= 0xFFFFFFF;
-	out[3] &= 0xFFFFFFF;
-	out[4] &= 0xFFFFFFF;
-	out[5] &= 0xFFFFFFF;
-	out[6] &= 0xFFFFFFF;
-	out[7] &= 0xFFFFFFF;
-	out[8] &= 0xFFFFFFF;
-}
-
-static void bigint28_shl1(R128_U64 out[5], R128_U64 in[5]) {
-	out[0] = (in[0] << 1) & 0xFFFFFFF;
-	out[1] = ((in[1] << 1) | (in[0] >> 27)) & 0xFFFFFFF;
-	out[2] = ((in[2] << 1) | (in[1] >> 27)) & 0xFFFFFFF;
-	out[3] = ((in[3] << 1) | (in[2] >> 27)) & 0xFFFFFFF;
-	out[4] = ((in[4] << 1) | (in[3] >> 27)) & 0xFFFFFFF;
-}
-
-static void bigint28_shr(R128_U64 out[10], R128_U64 in[10], int amount) {
-	if (amount >= 140) {
-		if (amount >= 196) {
-			if (amount >= 252) {
-				out[0] = in[9] >> (amount - 252);
-				out[1] = out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = out[8] = out[9] = 0;
-			} else if (amount >= 224) {
-				out[0] = ((in[9] << (252 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 224));
-				out[1] = in[9] >> (amount - 224);
-				out[2] = out[3] = out[4] = out[5] = out[6] = out[7] = out[8] = out[9] = 0;
-			} else {
-				out[0] = ((in[8] << (224 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 196));
-				out[1] = ((in[9] << (224 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 196));
-				out[2] = in[9] >> (amount - 196);
-				out[3] = out[4] = out[5] = out[6] = out[7] = out[8] = out[9] = 0;
-			}
-		} else if (amount >= 168) {
-			out[0] = ((in[7] << (196 - amount)) & 0xFFFFFFF) | (in[6] >> (amount - 168));
-			out[1] = ((in[8] << (196 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 168));
-			out[2] = ((in[9] << (196 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 168));
-			out[3] = in[9] >> (amount - 168);
-			out[4] = out[5] = out[6] = out[7] = out[8] = out[9] = 0;
-		} else {
-			out[0] = ((in[6] << (168 - amount)) & 0xFFFFFFF) | (in[5] >> (amount - 140));
-			out[1] = ((in[7] << (168 - amount)) & 0xFFFFFFF) | (in[6] >> (amount - 140));
-			out[2] = ((in[8] << (168 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 140));
-			out[3] = ((in[9] << (168 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 140));
-			out[4] = in[9] >> (amount - 140);
-			out[5] = out[6] = out[7] = out[8] = out[9] = 0;
-		}
-	} else if (amount >= 56) {
-		if (amount >= 112) {
-			out[0] = ((in[5] << (140 - amount)) & 0xFFFFFFF) | (in[4] >> (amount - 112));
-			out[1] = ((in[6] << (140 - amount)) & 0xFFFFFFF) | (in[5] >> (amount - 112));
-			out[2] = ((in[7] << (140 - amount)) & 0xFFFFFFF) | (in[6] >> (amount - 112));
-			out[3] = ((in[8] << (140 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 112));
-			out[4] = ((in[9] << (140 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 112));
-			out[5] = in[9] >> (amount - 112);
-			out[6] = out[7] = out[8] = out[9] = 0;
-		} else if (amount >= 84) {
-			out[0] = ((in[4] << (112 - amount)) & 0xFFFFFFF) | (in[3] >> (amount - 84));
-			out[1] = ((in[5] << (112 - amount)) & 0xFFFFFFF) | (in[4] >> (amount - 84));
-			out[2] = ((in[6] << (112 - amount)) & 0xFFFFFFF) | (in[5] >> (amount - 84));
-			out[3] = ((in[7] << (112 - amount)) & 0xFFFFFFF) | (in[6] >> (amount - 84));
-			out[4] = ((in[8] << (112 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 84));
-			out[5] = ((in[9] << (112 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 84));
-			out[6] = in[9] >> (amount - 84);
-			out[7] = out[8] = out[9] = 0;
-		} else {
-			out[0] = ((in[3] << (84 - amount)) & 0xFFFFFFF) | (in[2] >> (amount - 56));
-			out[1] = ((in[4] << (84 - amount)) & 0xFFFFFFF) | (in[3] >> (amount - 56));
-			out[2] = ((in[5] << (84 - amount)) & 0xFFFFFFF) | (in[4] >> (amount - 56));
-			out[3] = ((in[6] << (84 - amount)) & 0xFFFFFFF) | (in[5] >> (amount - 56));
-			out[4] = ((in[7] << (84 - amount)) & 0xFFFFFFF) | (in[6] >> (amount - 56));
-			out[5] = ((in[8] << (84 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 56));
-			out[6] = ((in[9] << (84 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 56));
-			out[7] = in[9] >> (amount - 56);
-			out[8] = out[9] = 0;
-		}
-	} else if (amount >= 28) {
-		out[0] = ((in[2] << (56 - amount)) & 0xFFFFFFF) | (in[1] >> (amount - 28));
-		out[1] = ((in[3] << (56 - amount)) & 0xFFFFFFF) | (in[2] >> (amount - 28));
-		out[2] = ((in[4] << (56 - amount)) & 0xFFFFFFF) | (in[3] >> (amount - 28));
-		out[3] = ((in[5] << (56 - amount)) & 0xFFFFFFF) | (in[4] >> (amount - 28));
-		out[4] = ((in[6] << (56 - amount)) & 0xFFFFFFF) | (in[5] >> (amount - 28));
-		out[5] = ((in[7] << (56 - amount)) & 0xFFFFFFF) | (in[6] >> (amount - 28));
-		out[6] = ((in[8] << (56 - amount)) & 0xFFFFFFF) | (in[7] >> (amount - 28));
-		out[7] = ((in[9] << (56 - amount)) & 0xFFFFFFF) | (in[8] >> (amount - 28));
-		out[8] = in[9] >> (amount - 28);
-		out[9] = 0;
-	} else {
-		out[0] = ((in[1] << (28 - amount)) & 0xFFFFFFF) | (in[0] >> amount);
-		out[1] = ((in[2] << (28 - amount)) & 0xFFFFFFF) | (in[1] >> amount);
-		out[2] = ((in[3] << (28 - amount)) & 0xFFFFFFF) | (in[2] >> amount);
-		out[3] = ((in[4] << (28 - amount)) & 0xFFFFFFF) | (in[3] >> amount);
-		out[4] = ((in[5] << (28 - amount)) & 0xFFFFFFF) | (in[4] >> amount);
-		out[5] = ((in[6] << (28 - amount)) & 0xFFFFFFF) | (in[5] >> amount);
-		out[6] = ((in[7] << (28 - amount)) & 0xFFFFFFF) | (in[6] >> amount);
-		out[7] = ((in[8] << (28 - amount)) & 0xFFFFFFF) | (in[7] >> amount);
-		out[8] = ((in[9] << (28 - amount)) & 0xFFFFFFF) | (in[8] >> amount);
-		out[9] = in[9] >> amount;
-	}
-}
-
-static void bigint28_div_1(R128_U64 out_mul[10], R128_U64 &out_mod, R128_U64 in1[10], R128_U64 in2) {
-	R128_U64 v = in1[9];
-	out_mul[9] = v / in2;
-	v = ((v % in2) << 28) | in1[8];
-	out_mul[8] = v / in2;
-	v = ((v % in2) << 28) | in1[7];
-	out_mul[7] = v / in2;
-	v = ((v % in2) << 28) | in1[6];
-	out_mul[6] = v / in2;
-	v = ((v % in2) << 28) | in1[5];
-	out_mul[5] = v / in2;
-	v = ((v % in2) << 28) | in1[4];
-	out_mul[4] = v / in2;
-	v = ((v % in2) << 28) | in1[3];
-	out_mul[3] = v / in2;
-	v = ((v % in2) << 28) | in1[2];
-	out_mul[2] = v / in2;
-	v = ((v % in2) << 28) | in1[1];
-	out_mul[1] = v / in2;
-	v = ((v % in2) << 28) | in1[0];
-	out_mul[0] = v / in2;
-	out_mod = (v % in2);
-}
-
-static int bigint28_clz(R128_U64 in) {
-	static const int de_bruijn[64] = {
-		63, 62, 61, 56, 60, 50, 55, 44,
-		59, 38, 49, 35, 54, 29, 43, 23,
-		58, 46, 37, 25, 48, 17, 34, 15,
-		53, 32, 28, 9, 42, 13, 22, 6,
-		0, 57, 51, 45, 39, 36, 30, 24,
-		47, 26, 18, 16, 33, 10, 14, 7,
-		1, 52, 40, 31, 27, 19, 11, 8,
-		2, 41, 20, 12, 3, 21, 4, 5
+static int bigint28_clz(int32_t p_in) {
+	static const int de_bruijn[32] = {
+		31, 30, 29, 25, 28, 20, 24, 15,
+		27, 17, 19, 10, 23, 8, 14, 5,
+		0, 26, 21, 16, 18, 11, 9, 6,
+		1, 22, 12, 7, 2, 13, 3, 4
 	};
-	in |= (in >> 1);
-	in |= (in >> 2);
-	in |= (in >> 4);
-	in |= (in >> 8);
-	in |= (in >> 16);
-	in |= (in >> 32);
-	in -= (in >> 1);
-	// De Bruijn 64-bit sequence derived using Burrows-Wheeler transform
-	return de_bruijn[(in * 0x0218A392CD3D5DBFULL) >> 58];
+	uint32_t v = static_cast<uint32_t>(p_in);
+	// Turn off every bit in v except the highest set, making it so that
+	// v == 1 << (31 - clz(v)), and ergo v * x == x << (31 - clz(v))
+	v |= (v >> 1);
+	v |= (v >> 2);
+	v |= (v >> 4);
+	v |= (v >> 8);
+	v |= (v >> 16);
+	v -= (v >> 1);
+	// De Bruijn 32-bit sequence derived using Burrows-Wheeler transform:
+	// For each x between 0 and 31, 04653ADF << x >> 27 yields a different
+	// number between 0 and 31, with no collisions
+	return de_bruijn[(v * 0x04653ADFUL) >> 27];
 }
 
-static bool bigint28_ge(R128_U64 in1[10], R128_U64 in2[5]) {
-	if (in1[5] || in1[6] || in1[7] || in1[8] || in1[9]) {
-		return true;
-	}
-	if (in1[4] > in2[4]) {
-		return true;
-	}
-	if (in1[4] < in2[4]) {
-		return false;
-	}
-	if (in1[3] > in2[3]) {
-		return true;
-	}
-	if (in1[3] < in2[3]) {
-		return false;
-	}
-	if (in1[2] > in2[2]) {
-		return true;
-	}
-	if (in1[2] < in2[2]) {
-		return false;
-	}
-	if (in1[1] > in2[1]) {
-		return true;
-	}
-	if (in1[1] < in2[1]) {
-		return false;
-	}
-	if (in1[0] >= in2[0]) {
-		return true;
-	}
-	return false;
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_copy(int32_t r_out[digits1], const int32_t p_in[digits2]);
+
+template <>
+static void bigint28_copy<5, 5>(int32_t r_out[5], const int32_t p_in[5]) {
+	r_out[0] = p_in[0];
+	r_out[1] = p_in[1];
+	r_out[2] = p_in[2];
+	r_out[3] = p_in[3];
+	r_out[4] = p_in[4];
 }
 
-static void bigint28_div(R128_U64 out_mul[10], R128_U64 out_mod[5], R128_U64 in1[10], R128_U64 in2[5]) {
-	R128_U64 div_msb = 0;
-	int div_shift = 0;
-	if (in2[4]) {
-		int bit = bigint28_clz(in2[4]);
-		div_msb = (in2[4] << (bit - 36)) | (in2[3] >> (64 - bit));
-		div_shift = 148 - bit;
-	} else if (in2[3]) {
-		int bit = bigint28_clz(in2[3]);
-		div_msb = (in2[3] << (bit - 36)) | (in2[2] >> (64 - bit));
-		div_shift = 120 - bit;
-	} else if (in2[2]) {
-		int bit = bigint28_clz(in2[2]);
-		div_msb = (in2[2] << (bit - 36)) | (in2[1] >> (64 - bit));
-		div_shift = 92 - bit;
-	} else if (in2[1]) {
-		int bit = bigint28_clz(in2[1]);
-		div_msb = (in2[1] << (bit - 36)) | (in2[0] >> (64 - bit));
-		div_shift = 64 - bit;
+template <>
+static void bigint28_copy<10, 10>(int32_t r_out[10], const int32_t p_in[10]) {
+	r_out[0] = p_in[0];
+	r_out[1] = p_in[1];
+	r_out[2] = p_in[2];
+	r_out[3] = p_in[3];
+	r_out[4] = p_in[4];
+	r_out[5] = p_in[5];
+	r_out[6] = p_in[6];
+	r_out[7] = p_in[7];
+	r_out[8] = p_in[8];
+	r_out[9] = p_in[9];
+}
+
+template <>
+static void bigint28_copy<15, 15>(int32_t r_out[15], const int32_t p_in[15]) {
+	r_out[0] = p_in[0];
+	r_out[1] = p_in[1];
+	r_out[2] = p_in[2];
+	r_out[3] = p_in[3];
+	r_out[4] = p_in[4];
+	r_out[5] = p_in[5];
+	r_out[6] = p_in[6];
+	r_out[7] = p_in[7];
+	r_out[8] = p_in[8];
+	r_out[9] = p_in[9];
+	r_out[10] = p_in[10];
+	r_out[11] = p_in[11];
+	r_out[12] = p_in[12];
+	r_out[13] = p_in[13];
+	r_out[14] = p_in[14];
+}
+
+template <>
+static void bigint28_copy<5, 10>(int32_t r_out[5], const int32_t p_in[10]) {
+	DEV_ASSERT((p_in[5] == 0 && p_in[6] == 0 && p_in[7] == 0 && p_in[8] == 0 && p_in[9] == 0) || (p_in[5] == 0xFFFFFFF && p_in[6] == 0xFFFFFFF && p_in[7] == 0xFFFFFFF && p_in[8] == 0xFFFFFFF && p_in[9] == -1));
+	r_out[0] = p_in[0];
+	r_out[1] = p_in[1];
+	r_out[2] = p_in[2];
+	r_out[3] = p_in[3];
+	r_out[4] = p_in[4] | ((p_in[9] >> 31) << 28);
+}
+
+template <>
+static void bigint28_copy<5, 15>(int32_t r_out[5], const int32_t p_in[15]) {
+	DEV_ASSERT((p_in[5] == 0 && p_in[6] == 0 && p_in[7] == 0 && p_in[8] == 0 && p_in[9] == 0 && p_in[10] == 0 && p_in[11] == 0 && p_in[12] == 0 && p_in[13] == 0 && p_in[14] == 0) || (p_in[5] == 0xFFFFFFF && p_in[6] == 0xFFFFFFF && p_in[7] == 0xFFFFFFF && p_in[8] == 0xFFFFFFF && p_in[9] == 0xFFFFFFF && p_in[10] == 0xFFFFFFF && p_in[11] == 0xFFFFFFF && p_in[12] == 0xFFFFFFF && p_in[13] == 0xFFFFFFF && p_in[14] == -1));
+	r_out[0] = p_in[0];
+	r_out[1] = p_in[1];
+	r_out[2] = p_in[2];
+	r_out[3] = p_in[3];
+	r_out[4] = p_in[4] | ((p_in[14] >> 31) << 28);
+}
+
+template <>
+static void bigint28_copy<10, 15>(int32_t r_out[10], const int32_t p_in[15]) {
+	DEV_ASSERT((p_in[10] == 0 && p_in[11] == 0 && p_in[12] == 0 && p_in[13] == 0 && p_in[14] == 0) || (p_in[10] == 0xFFFFFFF && p_in[11] == 0xFFFFFFF && p_in[12] == 0xFFFFFFF && p_in[13] == 0xFFFFFFF && p_in[14] == -1));
+	r_out[0] = p_in[0];
+	r_out[1] = p_in[1];
+	r_out[2] = p_in[2];
+	r_out[3] = p_in[3];
+	r_out[4] = p_in[4];
+	r_out[5] = p_in[5];
+	r_out[6] = p_in[6];
+	r_out[7] = p_in[7];
+	r_out[8] = p_in[8];
+	r_out[9] = p_in[9] | ((p_in[14] >> 31) << 28);
+}
+
+template <uint32_t digits>
+static void bigint28_clear(int32_t r_out[digits]);
+
+template <>
+static void bigint28_clear<5>(int32_t r_out[5]) {
+	r_out[0] = r_out[1] = r_out[2] = r_out[3] = r_out[4] = 0;
+}
+
+template <>
+static void bigint28_clear<10>(int32_t r_out[10]) {
+	r_out[0] = r_out[1] = r_out[2] = r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = 0;
+}
+
+template <>
+static void bigint28_clear<15>(int32_t r_out[15]) {
+	r_out[0] = r_out[1] = r_out[2] = r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = 0;
+}
+
+template <uint32_t digits>
+static void bigint28_neg(int32_t r_out[digits], const int32_t p_in[digits]);
+
+template <>
+static void bigint28_neg<5>(int32_t r_out[5], const int32_t p_in[5]) {
+	r_out[0] = (p_in[0] ^ 0xFFFFFFF) + 1;
+	r_out[1] = (p_in[1] ^ 0xFFFFFFF) + (r_out[0] >> 28);
+	r_out[2] = (p_in[2] ^ 0xFFFFFFF) + (r_out[1] >> 28);
+	r_out[3] = (p_in[3] ^ 0xFFFFFFF) + (r_out[2] >> 28);
+	r_out[4] = (~p_in[4]) + (r_out[3] >> 28);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_neg<10>(int32_t r_out[10], const int32_t p_in[10]) {
+	r_out[0] = (p_in[0] ^ 0xFFFFFFF) + 1;
+	r_out[1] = (p_in[1] ^ 0xFFFFFFF) + (r_out[0] >> 28);
+	r_out[2] = (p_in[2] ^ 0xFFFFFFF) + (r_out[1] >> 28);
+	r_out[3] = (p_in[3] ^ 0xFFFFFFF) + (r_out[2] >> 28);
+	r_out[4] = (p_in[4] ^ 0xFFFFFFF) + (r_out[3] >> 28);
+	r_out[5] = (p_in[5] ^ 0xFFFFFFF) + (r_out[4] >> 28);
+	r_out[6] = (p_in[6] ^ 0xFFFFFFF) + (r_out[5] >> 28);
+	r_out[7] = (p_in[7] ^ 0xFFFFFFF) + (r_out[6] >> 28);
+	r_out[8] = (p_in[8] ^ 0xFFFFFFF) + (r_out[7] >> 28);
+	r_out[9] = (~p_in[9]) + (r_out[8] >> 28);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_neg<15>(int32_t r_out[15], const int32_t p_in[15]) {
+	r_out[0] = (p_in[0] ^ 0xFFFFFFF) + 1;
+	r_out[1] = (p_in[1] ^ 0xFFFFFFF) + (r_out[0] >> 28);
+	r_out[2] = (p_in[2] ^ 0xFFFFFFF) + (r_out[1] >> 28);
+	r_out[3] = (p_in[3] ^ 0xFFFFFFF) + (r_out[2] >> 28);
+	r_out[4] = (p_in[4] ^ 0xFFFFFFF) + (r_out[3] >> 28);
+	r_out[5] = (p_in[5] ^ 0xFFFFFFF) + (r_out[4] >> 28);
+	r_out[6] = (p_in[6] ^ 0xFFFFFFF) + (r_out[5] >> 28);
+	r_out[7] = (p_in[7] ^ 0xFFFFFFF) + (r_out[6] >> 28);
+	r_out[8] = (p_in[8] ^ 0xFFFFFFF) + (r_out[7] >> 28);
+	r_out[9] = (p_in[9] ^ 0xFFFFFFF) + (r_out[8] >> 28);
+	r_out[10] = (p_in[10] ^ 0xFFFFFFF) + (r_out[9] >> 28);
+	r_out[11] = (p_in[11] ^ 0xFFFFFFF) + (r_out[10] >> 28);
+	r_out[12] = (p_in[12] ^ 0xFFFFFFF) + (r_out[11] >> 28);
+	r_out[13] = (p_in[13] ^ 0xFFFFFFF) + (r_out[12] >> 28);
+	r_out[14] = (~p_in[14]) + (r_out[13] >> 28);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+	r_out[9] &= 0xFFFFFFF;
+	r_out[10] &= 0xFFFFFFF;
+	r_out[11] &= 0xFFFFFFF;
+	r_out[12] &= 0xFFFFFFF;
+	r_out[13] &= 0xFFFFFFF;
+}
+
+template <uint32_t digits>
+static int bigint28_sign(const int32_t p_in[digits]);
+
+template <>
+static int bigint28_sign<5>(const int32_t p_in[5]) {
+	if (p_in[4] < 0) {
+		return -1;
+	}
+	if (p_in[0] || p_in[1] || p_in[2] || p_in[3] || p_in[4]) {
+		return 1;
+	}
+	return 0;
+}
+
+template <>
+static int bigint28_sign<10>(const int32_t p_in[10]) {
+	if (p_in[9] < 0) {
+		return -1;
+	}
+	if (p_in[0] || p_in[1] || p_in[2] || p_in[3] || p_in[4] || p_in[5] || p_in[6] || p_in[7] || p_in[8] || p_in[9]) {
+		return 1;
+	}
+	return 0;
+}
+
+template <>
+static int bigint28_sign<15>(const int32_t p_in[15]) {
+	if (p_in[14] < 0) {
+		return -1;
+	}
+	if (p_in[0] || p_in[1] || p_in[2] || p_in[3] || p_in[4] || p_in[5] || p_in[6] || p_in[7] || p_in[8] || p_in[9] || p_in[10] || p_in[11] || p_in[12] || p_in[13] || p_in[14]) {
+		return 1;
+	}
+	return 0;
+}
+
+template <uint32_t digits>
+static void bigint28_add1(int32_t r_out[digits]);
+
+template <>
+static void bigint28_add1<5>(int32_t r_out[5]) {
+	r_out[0]++;
+	r_out[1] += r_out[0] >> 28;
+	r_out[2] += r_out[1] >> 28;
+	r_out[3] += r_out[2] >> 28;
+	r_out[4] += r_out[3] >> 28;
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_add1<10>(int32_t r_out[10]) {
+	r_out[0]++;
+	r_out[1] += r_out[0] >> 28;
+	r_out[2] += r_out[1] >> 28;
+	r_out[3] += r_out[2] >> 28;
+	r_out[4] += r_out[3] >> 28;
+	r_out[5] += r_out[4] >> 28;
+	r_out[6] += r_out[5] >> 28;
+	r_out[7] += r_out[6] >> 28;
+	r_out[8] += r_out[7] >> 28;
+	r_out[9] += r_out[8] >> 28;
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_add1<15>(int32_t r_out[15]) {
+	r_out[0]++;
+	r_out[1] += r_out[0] >> 28;
+	r_out[2] += r_out[1] >> 28;
+	r_out[3] += r_out[2] >> 28;
+	r_out[4] += r_out[3] >> 28;
+	r_out[5] += r_out[4] >> 28;
+	r_out[6] += r_out[5] >> 28;
+	r_out[7] += r_out[6] >> 28;
+	r_out[8] += r_out[7] >> 28;
+	r_out[9] += r_out[8] >> 28;
+	r_out[10] += r_out[9] >> 28;
+	r_out[11] += r_out[10] >> 28;
+	r_out[12] += r_out[11] >> 28;
+	r_out[13] += r_out[12] >> 28;
+	r_out[14] += r_out[13] >> 28;
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+	r_out[9] &= 0xFFFFFFF;
+	r_out[10] &= 0xFFFFFFF;
+	r_out[11] &= 0xFFFFFFF;
+	r_out[12] &= 0xFFFFFFF;
+	r_out[13] &= 0xFFFFFFF;
+}
+
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_add(int32_t r_out[digits1], const int32_t p_in[digits2]);
+
+template <>
+static void bigint28_add<10, 10>(int32_t r_out[10], const int32_t p_in[10]) {
+	r_out[0] += p_in[0];
+	r_out[1] += p_in[1] + (r_out[0] >> 28);
+	r_out[2] += p_in[2] + (r_out[1] >> 28);
+	r_out[3] += p_in[3] + (r_out[2] >> 28);
+	r_out[4] += p_in[4] + (r_out[3] >> 28);
+	r_out[5] += p_in[5] + (r_out[4] >> 28);
+	r_out[6] += p_in[6] + (r_out[5] >> 28);
+	r_out[7] += p_in[7] + (r_out[6] >> 28);
+	r_out[8] += p_in[8] + (r_out[7] >> 28);
+	r_out[9] += p_in[9] + (r_out[8] >> 28);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_add<10, 5>(int32_t r_out[10], const int32_t p_in[5]) {
+	r_out[0] += p_in[0];
+	r_out[1] += p_in[1] + (r_out[0] >> 28);
+	r_out[2] += p_in[2] + (r_out[1] >> 28);
+	r_out[3] += p_in[3] + (r_out[2] >> 28);
+	r_out[4] += p_in[4] + (r_out[3] >> 28);
+	r_out[5] += r_out[4] >> 28;
+	r_out[6] += r_out[5] >> 28;
+	r_out[7] += r_out[6] >> 28;
+	r_out[8] += r_out[7] >> 28;
+	r_out[9] += r_out[8] >> 28;
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_add<15, 15>(int32_t r_out[10], const int32_t p_in[15]) {
+	r_out[0] += p_in[0];
+	r_out[1] += p_in[1] + (r_out[0] >> 28);
+	r_out[2] += p_in[2] + (r_out[1] >> 28);
+	r_out[3] += p_in[3] + (r_out[2] >> 28);
+	r_out[4] += p_in[4] + (r_out[3] >> 28);
+	r_out[5] += p_in[5] + (r_out[4] >> 28);
+	r_out[6] += p_in[6] + (r_out[5] >> 28);
+	r_out[7] += p_in[7] + (r_out[6] >> 28);
+	r_out[8] += p_in[8] + (r_out[7] >> 28);
+	r_out[9] += p_in[9] + (r_out[8] >> 28);
+	r_out[10] += p_in[10] + (r_out[9] >> 28);
+	r_out[11] += p_in[11] + (r_out[10] >> 28);
+	r_out[12] += p_in[12] + (r_out[11] >> 28);
+	r_out[13] += p_in[13] + (r_out[12] >> 28);
+	r_out[14] += p_in[14] + (r_out[13] >> 28);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+	r_out[9] &= 0xFFFFFFF;
+	r_out[10] &= 0xFFFFFFF;
+	r_out[11] &= 0xFFFFFFF;
+	r_out[12] &= 0xFFFFFFF;
+	r_out[13] &= 0xFFFFFFF;
+}
+
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_sub(int32_t r_out[digits1], const int32_t p_in[digits2]);
+
+template <>
+static void bigint28_sub<5, 5>(int32_t r_out[5], const int32_t p_in[5]) {
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_sub<10, 10>(int32_t r_out[10], const int32_t p_in[10]) {
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[5] -= p_in[5] + ((r_out[4] >> 28) & 1);
+	r_out[6] -= p_in[6] + ((r_out[5] >> 28) & 1);
+	r_out[7] -= p_in[7] + ((r_out[6] >> 28) & 1);
+	r_out[8] -= p_in[8] + ((r_out[7] >> 28) & 1);
+	r_out[9] -= p_in[9] + ((r_out[8] >> 28) & 1);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_sub<10, 5>(int32_t r_out[10], const int32_t p_in[5]) {
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[5] -= (r_out[4] >> 28) & 1;
+	r_out[6] -= (r_out[5] >> 28) & 1;
+	r_out[7] -= (r_out[6] >> 28) & 1;
+	r_out[8] -= (r_out[7] >> 28) & 1;
+	r_out[9] -= (r_out[8] >> 28) & 1;
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_sub<15, 15>(int32_t r_out[15], const int32_t p_in[15]) {
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[5] -= p_in[5] + ((r_out[4] >> 28) & 1);
+	r_out[6] -= p_in[6] + ((r_out[5] >> 28) & 1);
+	r_out[7] -= p_in[7] + ((r_out[6] >> 28) & 1);
+	r_out[8] -= p_in[8] + ((r_out[7] >> 28) & 1);
+	r_out[9] -= p_in[9] + ((r_out[8] >> 28) & 1);
+	r_out[10] -= p_in[10] + ((r_out[9] >> 28) & 1);
+	r_out[11] -= p_in[11] + ((r_out[10] >> 28) & 1);
+	r_out[12] -= p_in[12] + ((r_out[11] >> 28) & 1);
+	r_out[13] -= p_in[13] + ((r_out[12] >> 28) & 1);
+	r_out[14] -= p_in[14] + ((r_out[13] >> 28) & 1);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+	r_out[9] &= 0xFFFFFFF;
+	r_out[10] &= 0xFFFFFFF;
+	r_out[11] &= 0xFFFFFFF;
+	r_out[12] &= 0xFFFFFFF;
+	r_out[13] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_sub<15, 10>(int32_t r_out[15], const int32_t p_in[10]) {
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[5] -= p_in[5] + ((r_out[4] >> 28) & 1);
+	r_out[6] -= p_in[6] + ((r_out[5] >> 28) & 1);
+	r_out[7] -= p_in[7] + ((r_out[6] >> 28) & 1);
+	r_out[8] -= p_in[8] + ((r_out[7] >> 28) & 1);
+	r_out[9] -= p_in[9] + ((r_out[8] >> 28) & 1);
+	r_out[10] -= (r_out[9] >> 28) & 1;
+	r_out[11] -= (r_out[10] >> 28) & 1;
+	r_out[12] -= (r_out[11] >> 28) & 1;
+	r_out[13] -= (r_out[12] >> 28) & 1;
+	r_out[14] -= (r_out[13] >> 28) & 1;
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+	r_out[9] &= 0xFFFFFFF;
+	r_out[10] &= 0xFFFFFFF;
+	r_out[11] &= 0xFFFFFFF;
+	r_out[12] &= 0xFFFFFFF;
+	r_out[13] &= 0xFFFFFFF;
+}
+
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_sub_positive(int32_t r_out[digits1], const int32_t p_in[digits2]);
+
+template <>
+static void bigint28_sub_positive<10, 15>(int32_t r_out[10], const int32_t p_in[15]) {
+	DEV_ASSERT(p_in[10] == 0 && p_in[11] == 0 && p_in[12] == 0 && p_in[13] == 0 && p_in[14] == 0);
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[5] -= p_in[5] + ((r_out[4] >> 28) & 1);
+	r_out[6] -= p_in[6] + ((r_out[5] >> 28) & 1);
+	r_out[7] -= p_in[7] + ((r_out[6] >> 28) & 1);
+	r_out[8] -= p_in[8] + ((r_out[7] >> 28) & 1);
+	r_out[9] -= p_in[9] + ((r_out[8] >> 28) & 1);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_sub_positive<15, 25>(int32_t r_out[15], const int32_t p_in[25]) {
+	DEV_ASSERT(p_in[15] == 0 && p_in[16] == 0 && p_in[17] == 0 && p_in[18] == 0 && p_in[19] == 0 && p_in[20] == 0 && p_in[21] == 0 && p_in[22] == 0 && p_in[23] == 0 && p_in[24] == 0);
+	r_out[0] -= p_in[0];
+	r_out[1] -= p_in[1] + ((r_out[0] >> 28) & 1);
+	r_out[2] -= p_in[2] + ((r_out[1] >> 28) & 1);
+	r_out[3] -= p_in[3] + ((r_out[2] >> 28) & 1);
+	r_out[4] -= p_in[4] + ((r_out[3] >> 28) & 1);
+	r_out[5] -= p_in[5] + ((r_out[4] >> 28) & 1);
+	r_out[6] -= p_in[6] + ((r_out[5] >> 28) & 1);
+	r_out[7] -= p_in[7] + ((r_out[6] >> 28) & 1);
+	r_out[8] -= p_in[8] + ((r_out[7] >> 28) & 1);
+	r_out[9] -= p_in[9] + ((r_out[8] >> 28) & 1);
+	r_out[10] -= p_in[10] + ((r_out[9] >> 28) & 1);
+	r_out[11] -= p_in[11] + ((r_out[10] >> 28) & 1);
+	r_out[12] -= p_in[12] + ((r_out[11] >> 28) & 1);
+	r_out[13] -= p_in[13] + ((r_out[12] >> 28) & 1);
+	r_out[14] -= p_in[14] + ((r_out[13] >> 28) & 1);
+	r_out[0] &= 0xFFFFFFF;
+	r_out[1] &= 0xFFFFFFF;
+	r_out[2] &= 0xFFFFFFF;
+	r_out[3] &= 0xFFFFFFF;
+	r_out[4] &= 0xFFFFFFF;
+	r_out[5] &= 0xFFFFFFF;
+	r_out[6] &= 0xFFFFFFF;
+	r_out[7] &= 0xFFFFFFF;
+	r_out[8] &= 0xFFFFFFF;
+	r_out[9] &= 0xFFFFFFF;
+	r_out[10] &= 0xFFFFFFF;
+	r_out[11] &= 0xFFFFFFF;
+	r_out[12] &= 0xFFFFFFF;
+	r_out[13] &= 0xFFFFFFF;
+}
+
+template <uint32_t digits>
+static void bigint28_shl1(int32_t r_out[digits]);
+
+template <>
+static void bigint28_shl1<5>(int32_t r_out[5]) {
+	r_out[4] = (r_out[4] << 1) | (r_out[3] >> 27);
+	r_out[3] = ((r_out[3] << 1) | (r_out[2] >> 27)) & 0xFFFFFFF;
+	r_out[2] = ((r_out[2] << 1) | (r_out[1] >> 27)) & 0xFFFFFFF;
+	r_out[1] = ((r_out[1] << 1) | (r_out[0] >> 27)) & 0xFFFFFFF;
+	r_out[0] = (r_out[0] << 1) & 0xFFFFFFF;
+}
+
+template <>
+static void bigint28_shl1<10>(int32_t r_out[10]) {
+	r_out[9] = (r_out[9] << 1) | (r_out[8] >> 27);
+	r_out[8] = ((r_out[8] << 1) | (r_out[7] >> 27)) & 0xFFFFFFF;
+	r_out[7] = ((r_out[7] << 1) | (r_out[6] >> 27)) & 0xFFFFFFF;
+	r_out[6] = ((r_out[6] << 1) | (r_out[5] >> 27)) & 0xFFFFFFF;
+	r_out[5] = ((r_out[5] << 1) | (r_out[4] >> 27)) & 0xFFFFFFF;
+	r_out[4] = ((r_out[4] << 1) | (r_out[3] >> 27)) & 0xFFFFFFF;
+	r_out[3] = ((r_out[3] << 1) | (r_out[2] >> 27)) & 0xFFFFFFF;
+	r_out[2] = ((r_out[2] << 1) | (r_out[1] >> 27)) & 0xFFFFFFF;
+	r_out[1] = ((r_out[1] << 1) | (r_out[0] >> 27)) & 0xFFFFFFF;
+	r_out[0] = (r_out[0] << 1) & 0xFFFFFFF;
+}
+
+template <uint32_t digits>
+static void bigint28_shr(int32_t r_out[digits], int p_amount);
+
+template <>
+static void bigint28_shr<10>(int32_t r_out[10], int p_amount) {
+	if (p_amount >= 140) {
+		if (p_amount >= 196) {
+			if (p_amount >= 252) {
+				r_out[0] = r_out[9] >> (p_amount - 252);
+				r_out[1] = r_out[2] = r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+			} else if (p_amount >= 224) {
+				r_out[0] = ((r_out[9] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 224));
+				r_out[1] = r_out[9] >> (p_amount - 224);
+				r_out[2] = r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+			} else {
+				r_out[0] = ((r_out[8] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 196));
+				r_out[1] = ((r_out[9] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 196));
+				r_out[2] = r_out[9] >> (p_amount - 196);
+				r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+			}
+		} else if (p_amount >= 168) {
+			r_out[0] = ((r_out[7] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 168));
+			r_out[1] = ((r_out[8] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 168));
+			r_out[2] = ((r_out[9] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 168));
+			r_out[3] = r_out[9] >> (p_amount - 168);
+			r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+		} else {
+			r_out[0] = ((r_out[6] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 140));
+			r_out[1] = ((r_out[7] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 140));
+			r_out[2] = ((r_out[8] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 140));
+			r_out[3] = ((r_out[9] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 140));
+			r_out[4] = r_out[9] >> (p_amount - 140);
+			r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+		}
+	} else if (p_amount >= 56) {
+		if (p_amount >= 112) {
+			r_out[0] = ((r_out[5] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 112));
+			r_out[1] = ((r_out[6] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 112));
+			r_out[2] = ((r_out[7] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 112));
+			r_out[3] = ((r_out[8] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 112));
+			r_out[4] = ((r_out[9] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 112));
+			r_out[5] = r_out[9] >> (p_amount - 112);
+			r_out[6] = r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+		} else if (p_amount >= 84) {
+			r_out[0] = ((r_out[4] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> (p_amount - 84));
+			r_out[1] = ((r_out[5] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 84));
+			r_out[2] = ((r_out[6] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 84));
+			r_out[3] = ((r_out[7] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 84));
+			r_out[4] = ((r_out[8] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 84));
+			r_out[5] = ((r_out[9] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 84));
+			r_out[6] = r_out[9] >> (p_amount - 84);
+			r_out[7] = r_out[8] = r_out[9] = (r_out[9] >> 31);
+		} else {
+			r_out[0] = ((r_out[3] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[2] >> (p_amount - 56));
+			r_out[1] = ((r_out[4] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> (p_amount - 56));
+			r_out[2] = ((r_out[5] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 56));
+			r_out[3] = ((r_out[6] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 56));
+			r_out[4] = ((r_out[7] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 56));
+			r_out[5] = ((r_out[8] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 56));
+			r_out[6] = ((r_out[9] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 56));
+			r_out[7] = r_out[9] >> (p_amount - 56);
+			r_out[8] = r_out[9] = (r_out[9] >> 31);
+		}
+	} else if (p_amount >= 28) {
+		r_out[0] = ((r_out[2] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[1] >> (p_amount - 28));
+		r_out[1] = ((r_out[3] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[2] >> (p_amount - 28));
+		r_out[2] = ((r_out[4] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> (p_amount - 28));
+		r_out[3] = ((r_out[5] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 28));
+		r_out[4] = ((r_out[6] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 28));
+		r_out[5] = ((r_out[7] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 28));
+		r_out[6] = ((r_out[8] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 28));
+		r_out[7] = ((r_out[9] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 28));
+		r_out[8] = r_out[9] >> (p_amount - 28);
+		r_out[9] = (r_out[9] >> 31);
 	} else {
-		bigint28_div_1(out_mul, out_mod[0], in1, in2[0]);
-		out_mod[1] = out_mod[2] = out_mod[3] = out_mod[4];
+		r_out[0] = ((r_out[1] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[0] >> p_amount);
+		r_out[1] = ((r_out[2] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[1] >> p_amount);
+		r_out[2] = ((r_out[3] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[2] >> p_amount);
+		r_out[3] = ((r_out[4] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> p_amount);
+		r_out[4] = ((r_out[5] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> p_amount);
+		r_out[5] = ((r_out[6] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> p_amount);
+		r_out[6] = ((r_out[7] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> p_amount);
+		r_out[7] = ((r_out[8] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> p_amount);
+		r_out[8] = ((r_out[9] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> p_amount);
+		r_out[9] = r_out[9] >> p_amount;
+	}
+}
+
+template <>
+static void bigint28_shr<15>(int32_t r_out[15], int p_amount) {
+	if (p_amount >= 196) {
+		if (p_amount >= 308) {
+			if (p_amount >= 364) {
+				if (p_amount >= 392) {
+					r_out[0] = r_out[14] >> (p_amount - 392);
+					r_out[1] = r_out[2] = r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+				} else {
+					r_out[0] = ((r_out[14] << (392 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 364));
+					r_out[1] = r_out[14] >> (p_amount - 364);
+					r_out[2] = r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+				}
+			} else if (p_amount >= 336) {
+				r_out[0] = ((r_out[13] << (364 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 336));
+				r_out[1] = ((r_out[14] << (364 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 336));
+				r_out[2] = r_out[14] >> (p_amount - 336);
+				r_out[3] = r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+			} else {
+				r_out[0] = ((r_out[12] << (336 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 308));
+				r_out[1] = ((r_out[13] << (336 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 308));
+				r_out[2] = ((r_out[14] << (336 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 308));
+				r_out[3] = r_out[14] >> (p_amount - 308);
+				r_out[4] = r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+			}
+		} else if (p_amount >= 252) {
+			if (p_amount >= 280) {
+				r_out[0] = ((r_out[11] << (308 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 280));
+				r_out[1] = ((r_out[12] << (308 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 280));
+				r_out[2] = ((r_out[13] << (308 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 280));
+				r_out[3] = ((r_out[14] << (308 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 280));
+				r_out[4] = r_out[14] >> (p_amount - 280);
+				r_out[5] = r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+			} else {
+				r_out[0] = ((r_out[10] << (280 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 252));
+				r_out[1] = ((r_out[11] << (280 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 252));
+				r_out[2] = ((r_out[12] << (280 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 252));
+				r_out[3] = ((r_out[13] << (280 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 252));
+				r_out[4] = ((r_out[14] << (280 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 252));
+				r_out[5] = r_out[14] >> (p_amount - 252);
+				r_out[6] = r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+			}
+		} else if (p_amount >= 224) {
+			r_out[0] = ((r_out[9] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 224));
+			r_out[1] = ((r_out[10] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 224));
+			r_out[2] = ((r_out[11] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 224));
+			r_out[3] = ((r_out[12] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 224));
+			r_out[4] = ((r_out[13] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 224));
+			r_out[5] = ((r_out[14] << (252 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 224));
+			r_out[6] = r_out[14] >> (p_amount - 224);
+			r_out[7] = r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+		} else {
+			r_out[0] = ((r_out[8] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 196));
+			r_out[1] = ((r_out[9] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 196));
+			r_out[2] = ((r_out[10] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 196));
+			r_out[3] = ((r_out[11] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 196));
+			r_out[4] = ((r_out[12] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 196));
+			r_out[5] = ((r_out[13] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 196));
+			r_out[6] = ((r_out[14] << (224 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 196));
+			r_out[7] = r_out[14] >> (p_amount - 196);
+			r_out[8] = r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+		}
+	} else if (p_amount >= 84) {
+		if (p_amount >= 140) {
+			if (p_amount >= 168) {
+				r_out[0] = ((r_out[7] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 168));
+				r_out[1] = ((r_out[8] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 168));
+				r_out[2] = ((r_out[9] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 168));
+				r_out[3] = ((r_out[10] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 168));
+				r_out[4] = ((r_out[11] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 168));
+				r_out[5] = ((r_out[12] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 168));
+				r_out[6] = ((r_out[13] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 168));
+				r_out[7] = ((r_out[14] << (196 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 168));
+				r_out[8] = r_out[14] >> (p_amount - 168);
+				r_out[9] = r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+			} else {
+				r_out[0] = ((r_out[6] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 140));
+				r_out[1] = ((r_out[7] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 140));
+				r_out[2] = ((r_out[8] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 140));
+				r_out[3] = ((r_out[9] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 140));
+				r_out[4] = ((r_out[10] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 140));
+				r_out[5] = ((r_out[11] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 140));
+				r_out[6] = ((r_out[12] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 140));
+				r_out[7] = ((r_out[13] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 140));
+				r_out[8] = ((r_out[14] << (168 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 140));
+				r_out[9] = r_out[14] >> (p_amount - 140);
+				r_out[10] = r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+			}
+		} else if (p_amount >= 112) {
+			r_out[0] = ((r_out[5] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 112));
+			r_out[1] = ((r_out[6] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 112));
+			r_out[2] = ((r_out[7] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 112));
+			r_out[3] = ((r_out[8] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 112));
+			r_out[4] = ((r_out[9] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 112));
+			r_out[5] = ((r_out[10] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 112));
+			r_out[6] = ((r_out[11] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 112));
+			r_out[7] = ((r_out[12] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 112));
+			r_out[8] = ((r_out[13] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 112));
+			r_out[9] = ((r_out[14] << (140 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 112));
+			r_out[10] = r_out[14] >> (p_amount - 112);
+			r_out[11] = r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+		} else {
+			r_out[0] = ((r_out[4] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> (p_amount - 84));
+			r_out[1] = ((r_out[5] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 84));
+			r_out[2] = ((r_out[6] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 84));
+			r_out[3] = ((r_out[7] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 84));
+			r_out[4] = ((r_out[8] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 84));
+			r_out[5] = ((r_out[9] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 84));
+			r_out[6] = ((r_out[10] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 84));
+			r_out[7] = ((r_out[11] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 84));
+			r_out[8] = ((r_out[12] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 84));
+			r_out[9] = ((r_out[13] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 84));
+			r_out[10] = ((r_out[14] << (112 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 84));
+			r_out[11] = r_out[14] >> (p_amount - 84);
+			r_out[12] = r_out[13] = r_out[14] = (r_out[14] >> 31);
+		}
+	} else if (p_amount >= 56) {
+		r_out[0] = ((r_out[3] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[2] >> (p_amount - 56));
+		r_out[1] = ((r_out[4] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> (p_amount - 56));
+		r_out[2] = ((r_out[5] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 56));
+		r_out[3] = ((r_out[6] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 56));
+		r_out[4] = ((r_out[7] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 56));
+		r_out[5] = ((r_out[8] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 56));
+		r_out[6] = ((r_out[9] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 56));
+		r_out[7] = ((r_out[10] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 56));
+		r_out[8] = ((r_out[11] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 56));
+		r_out[9] = ((r_out[12] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 56));
+		r_out[10] = ((r_out[13] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 56));
+		r_out[11] = ((r_out[14] << (84 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 56));
+		r_out[12] = r_out[14] >> (p_amount - 56);
+		r_out[13] = r_out[14] = (r_out[14] >> 31);
+	} else if (p_amount >= 28) {
+		r_out[0] = ((r_out[2] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[1] >> (p_amount - 28));
+		r_out[1] = ((r_out[3] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[2] >> (p_amount - 28));
+		r_out[2] = ((r_out[4] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> (p_amount - 28));
+		r_out[3] = ((r_out[5] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> (p_amount - 28));
+		r_out[4] = ((r_out[6] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> (p_amount - 28));
+		r_out[5] = ((r_out[7] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> (p_amount - 28));
+		r_out[6] = ((r_out[8] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> (p_amount - 28));
+		r_out[7] = ((r_out[9] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> (p_amount - 28));
+		r_out[8] = ((r_out[10] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> (p_amount - 28));
+		r_out[9] = ((r_out[11] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> (p_amount - 28));
+		r_out[10] = ((r_out[12] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> (p_amount - 28));
+		r_out[11] = ((r_out[13] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> (p_amount - 28));
+		r_out[12] = ((r_out[14] << (56 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> (p_amount - 28));
+		r_out[13] = r_out[14] >> (p_amount - 28);
+		r_out[14] = (r_out[14] >> 31);
+	} else {
+		r_out[0] = ((r_out[1] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[0] >> p_amount);
+		r_out[1] = ((r_out[2] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[1] >> p_amount);
+		r_out[2] = ((r_out[3] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[2] >> p_amount);
+		r_out[3] = ((r_out[4] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[3] >> p_amount);
+		r_out[4] = ((r_out[5] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[4] >> p_amount);
+		r_out[5] = ((r_out[6] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[5] >> p_amount);
+		r_out[6] = ((r_out[7] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[6] >> p_amount);
+		r_out[7] = ((r_out[8] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[7] >> p_amount);
+		r_out[8] = ((r_out[9] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[8] >> p_amount);
+		r_out[9] = ((r_out[10] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[9] >> p_amount);
+		r_out[10] = ((r_out[11] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[10] >> p_amount);
+		r_out[11] = ((r_out[12] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[11] >> p_amount);
+		r_out[12] = ((r_out[13] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[12] >> p_amount);
+		r_out[13] = ((r_out[14] << (28 - p_amount)) & 0xFFFFFFF) | (r_out[13] >> p_amount);
+		r_out[14] = r_out[14] >> p_amount;
+	}
+}
+
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_mul_positive(int32_t r_out[digits1 + digits2], const int32_t p_in1[digits1], const int32_t p_in2[digits2]);
+
+template <>
+static void bigint28_mul_positive<5, 5>(int32_t r_out[10], const int32_t p_in1[5], const int32_t p_in2[5]) {
+	DEV_ASSERT(p_in1[4] >= 0 && p_in2[4] >= 0);
+	uint64_t v = static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[0]);
+	r_out[0] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[1]) + (v >> 28);
+	r_out[1] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[2]) + (v >> 28);
+	r_out[2] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[3]) + (v >> 28);
+	r_out[3] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[4] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[5] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[6] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[7] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[8] = static_cast<int32_t>(v & 0xFFFFFFF);
+	r_out[9] = static_cast<int32_t>(v >> 28);
+}
+
+template <>
+static void bigint28_mul_positive<10, 5>(int32_t r_out[15], const int32_t p_in1[10], const int32_t p_in2[5]) {
+	DEV_ASSERT(p_in1[9] >= 0 && p_in2[4] >= 0);
+	uint64_t v = static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[0]);
+	r_out[0] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[1]) + (v >> 28);
+	r_out[1] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[2]) + (v >> 28);
+	r_out[2] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[3]) + (v >> 28);
+	r_out[3] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[4] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[5] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[6] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[7] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[8] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[9] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[10] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[11] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[12] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[13] = static_cast<int32_t>(v & 0xFFFFFFF);
+	r_out[14] = static_cast<int32_t>(v >> 28);
+}
+
+template <>
+static void bigint28_mul_positive<15, 10>(int32_t r_out[25], const int32_t p_in1[15], const int32_t p_in2[10]) {
+	DEV_ASSERT(p_in1[14] >= 0 && p_in2[9] >= 0);
+	uint64_t v = static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[0]);
+	r_out[0] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[1]) + (v >> 28);
+	r_out[1] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[2]) + (v >> 28);
+	r_out[2] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[3]) + (v >> 28);
+	r_out[3] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[4]) + (v >> 28);
+	r_out[4] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[5]) + (v >> 28);
+	r_out[5] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[6]) + (v >> 28);
+	r_out[6] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[7]) + (v >> 28);
+	r_out[7] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[8]) + (v >> 28);
+	r_out[8] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[0]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[9] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[1]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[10] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[2]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[11] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[3]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[12] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[4]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[13] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[0]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[5]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[14] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[1]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[6]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[15] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[2]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[7]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[16] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[3]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[8]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[17] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[4]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[9]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[18] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[5]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[10]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[19] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[6]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[11]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[20] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[7]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[12]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[21] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[8]) + static_cast<uint64_t>(p_in1[13]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[22] = static_cast<int32_t>(v & 0xFFFFFFF);
+	v = static_cast<uint64_t>(p_in1[14]) * static_cast<uint64_t>(p_in2[9]) + (v >> 28);
+	r_out[23] = static_cast<int32_t>(v & 0xFFFFFFF);
+	r_out[24] = static_cast<int32_t>(v >> 28);
+}
+
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_mul(int32_t r_out[digits1 + digits2], const int32_t p_in1[digits1], const int32_t p_in2[digits2]) {
+	if (p_in1[digits1 - 1] < 0) {
+		int32_t in1_neg[digits1];
+		bigint28_neg<digits1>(in1_neg, p_in1);
+		if (p_in2[digits2 - 1] < 0) {
+			int32_t in2_neg[digits2];
+			bigint28_neg<digits2>(in2_neg, p_in2);
+			bigint28_mul_positive<digits1, digits2>(r_out, in1_neg, in2_neg);
+		} else {
+			int32_t out_neg[digits1 + digits2];
+			bigint28_mul_positive<digits1, digits2>(out_neg, in1_neg, p_in2);
+			bigint28_neg<digits1 + digits2>(r_out, out_neg);
+		}
+	} else if (p_in2[digits2 - 1] < 0) {
+		int32_t in2_neg[digits2];
+		int32_t out_neg[digits1 + digits2];
+		bigint28_neg<digits2>(in2_neg, p_in2);
+		bigint28_mul_positive<digits1, digits2>(out_neg, p_in1, in2_neg);
+		bigint28_neg<digits1 + digits2>(r_out, out_neg);
+	} else {
+		bigint28_mul_positive<digits1, digits2>(r_out, p_in1, p_in2);
+	}
+}
+
+template <uint32_t digits>
+static void bigint28_div_positive_1(int32_t r_out[digits], int32_t &r_mod, const int32_t p_in1[digits], int32_t p_in2);
+
+template <>
+static void bigint28_div_positive_1<10>(int32_t r_out[10], int32_t &r_mod, const int32_t p_in1[10], int32_t p_in2) {
+	DEV_ASSERT(p_in1[9] >= 0 && p_in2 > 0);
+	uint64_t in2 = static_cast<uint64_t>(p_in2);
+	uint64_t v = static_cast<uint64_t>(p_in1[9]);
+	r_out[9] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[8]);
+	r_out[8] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[7]);
+	r_out[7] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[6]);
+	r_out[6] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[5]);
+	r_out[5] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[4]);
+	r_out[4] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[3]);
+	r_out[3] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[2]);
+	r_out[2] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[1]);
+	r_out[1] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[0]);
+	r_out[0] = static_cast<int32_t>(v / in2);
+	r_mod = (v % in2);
+}
+
+template <>
+static void bigint28_div_positive_1<15>(int32_t r_out[15], int32_t &r_mod, const int32_t p_in1[15], int32_t p_in2) {
+	DEV_ASSERT(p_in1[14] >= 0 && p_in2 > 0);
+	uint64_t in2 = static_cast<uint64_t>(p_in2);
+	uint64_t v = static_cast<uint64_t>(p_in1[14]);
+	r_out[14] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[13]);
+	r_out[13] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[12]);
+	r_out[12] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[11]);
+	r_out[11] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[10]);
+	r_out[10] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[9]);
+	r_out[9] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[8]);
+	r_out[8] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[7]);
+	r_out[7] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[6]);
+	r_out[6] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[5]);
+	r_out[5] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[4]);
+	r_out[4] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[3]);
+	r_out[3] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[2]);
+	r_out[2] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[1]);
+	r_out[1] = static_cast<int32_t>(v / in2);
+	v = ((v % in2) << 28) | static_cast<uint64_t>(p_in1[0]);
+	r_out[0] = static_cast<int32_t>(v / in2);
+	r_mod = (v % in2);
+}
+
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_div_positive(int32_t r_out[digits1], int32_t r_mod[digits2], const int32_t p_in1[digits1], const int32_t p_in2[digits2]) {
+	DEV_ASSERT(p_in1[digits1 - 1] >= 0 && bigint28_sign<digits2>(p_in2) > 0);
+	int32_t div_msb = 0;
+	int div_shift = 0;
+	if (digits2 > 9 && p_in2[9]) {
+		int bit = bigint28_clz(p_in2[9]);
+		div_msb = (p_in2[9] << (bit - 4)) | (p_in2[8] >> (32 - bit));
+		div_shift = 256 - bit;
+	} else if (digits2 > 8 && p_in2[8]) {
+		int bit = bigint28_clz(p_in2[8]);
+		div_msb = (p_in2[8] << (bit - 4)) | (p_in2[7] >> (32 - bit));
+		div_shift = 228 - bit;
+	} else if (digits2 > 7 && p_in2[7]) {
+		int bit = bigint28_clz(p_in2[7]);
+		div_msb = (p_in2[7] << (bit - 4)) | (p_in2[6] >> (32 - bit));
+		div_shift = 200 - bit;
+	} else if (digits2 > 6 && p_in2[6]) {
+		int bit = bigint28_clz(p_in2[6]);
+		div_msb = (p_in2[6] << (bit - 4)) | (p_in2[5] >> (32 - bit));
+		div_shift = 172 - bit;
+	} else if (digits2 > 5 && p_in2[5]) {
+		int bit = bigint28_clz(p_in2[5]);
+		div_msb = (p_in2[5] << (bit - 4)) | (p_in2[4] >> (32 - bit));
+		div_shift = 144 - bit;
+	} else if (digits2 > 4 && p_in2[4]) {
+		int bit = bigint28_clz(p_in2[4]);
+		div_msb = (p_in2[4] << (bit - 4)) | (p_in2[3] >> (32 - bit));
+		div_shift = 116 - bit;
+	} else if (digits2 > 3 && p_in2[3]) {
+		int bit = bigint28_clz(p_in2[3]);
+		div_msb = (p_in2[3] << (bit - 4)) | (p_in2[2] >> (32 - bit));
+		div_shift = 88 - bit;
+	} else if (digits2 > 2 && p_in2[2]) {
+		int bit = bigint28_clz(p_in2[2]);
+		div_msb = (p_in2[2] << (bit - 4)) | (p_in2[1] >> (32 - bit));
+		div_shift = 60 - bit;
+	} else if (digits2 > 1 && p_in2[1]) {
+		int bit = bigint28_clz(p_in2[1]);
+		div_msb = (p_in2[1] << (bit - 4)) | (p_in2[0] >> (32 - bit));
+		div_shift = 32 - bit;
+	} else {
+		bigint28_clear<digits2>(r_mod);
+		bigint28_div_positive_1<digits1>(r_out, r_mod[0], p_in1, p_in2[0]);
 		return;
 	}
 	div_msb++;
-	R128_U64 mod[10];
-	mod[0] = in1[0];
-	mod[1] = in1[1];
-	mod[2] = in1[2];
-	mod[3] = in1[3];
-	mod[4] = in1[4];
-	mod[5] = in1[5];
-	mod[6] = in1[6];
-	mod[7] = in1[7];
-	mod[8] = in1[8];
-	mod[9] = in1[9];
-	out_mul[0] = out_mul[1] = out_mul[2] = out_mul[3] = out_mul[4] = out_mul[5] = out_mul[6] = out_mul[7] = out_mul[8] = out_mul[9] = 0;
-	R128_U64 in2_shl1[5];
-	bigint28_shl1(in2_shl1, in2);
-	while (bigint28_ge(mod, in2_shl1)) {
-		R128_U64 tmp_mod;
-		R128_U64 tmp_mul[10];
-		bigint28_div_1(tmp_mul, tmp_mod, mod, div_msb);
-		R128_U64 tmp_mul_shr[10];
-		bigint28_shr(tmp_mul_shr, tmp_mul, div_shift);
-		bigint28_add_10(out_mul, tmp_mul_shr);
-		bigint28_mul_10(tmp_mul, tmp_mul_shr, in2);
-		bigint28_sub_10(mod, tmp_mul);
+	int32_t mod[digits1];
+	bigint28_copy<digits1, digits1>(mod, p_in1);
+	bigint28_clear<digits1>(r_out);
+	int32_t in2_shl1[digits2];
+	bigint28_copy<digits2, digits2>(in2_shl1, p_in2);
+	bigint28_shl1<digits2>(in2_shl1);
+	int32_t check[digits1];
+	bigint28_copy<digits1, digits1>(check, mod);
+	bigint28_sub<digits1, digits2>(check, in2_shl1);
+	while (check[digits1 - 1] >= 0) {
+		int32_t tmp_mod;
+		int32_t tmp_div[digits1];
+		bigint28_div_positive_1<digits1>(tmp_div, tmp_mod, mod, div_msb);
+		bigint28_shr<digits1>(tmp_div, div_shift);
+		bigint28_add<digits1, digits1>(r_out, tmp_div);
+		int32_t tmp_mul[digits1 + digits2];
+		bigint28_mul_positive<digits1, digits2>(tmp_mul, tmp_div, p_in2);
+		bigint28_sub_positive<digits1, digits1 + digits2>(mod, tmp_mul);
+		bigint28_copy<digits1, digits1>(check, mod);
+		bigint28_sub<digits1, digits2>(check, in2_shl1);
 	}
-	if (bigint28_ge(mod, in2)) {
-		bigint28_sub(mod, in2);
-		R128_U64 tmp_add1[10] = { 1 };
-		bigint28_add_10(out_mul, tmp_add1);
+	bigint28_copy<digits1, digits1>(check, mod);
+	bigint28_sub<digits1, digits2>(check, p_in2);
+	if (check[digits1 - 1] >= 0) {
+		bigint28_copy<digits1, digits1>(mod, check);
+		bigint28_add1<digits1>(r_out);
 	}
-	out_mod[0] = mod[0];
-	out_mod[1] = mod[1];
-	out_mod[2] = mod[2];
-	out_mod[3] = mod[3];
-	out_mod[4] = mod[4];
+	bigint28_copy<digits2, digits1>(r_mod, mod);
 }
 
-/**
- * Implements mul1 * mul2 / div in a way that does not introduce
- * rounding errors. Returns the result in the form ret + mod / div
- * where 0 <= mod < div
- **/
-static void quotient_positive(R128 mul1, R128 mul2, R128 div, R128 &ret, R128 &mod) {
-	DEV_ASSERT(div > R128_zero);
-	if (mul1 == R128_zero || mul2 == R128_zero) {
-		ret = R128_zero;
-		mod = R128_zero;
-		return;
-	}
-	if (mul1 == div) {
-		ret = mul2;
-		mod = R128_zero;
-		return;
-	}
-	if (mul2 == div) {
-		ret = mul1;
-		mod = R128_zero;
-		return;
-	}
-	R128_U64 a[5];
-	R128_U64 b[5];
-	R128_U64 c[10];
-	R128_U64 d[5];
-	bigint28_from_r128(a, mul1);
-	bigint28_from_r128(b, mul2);
-	bigint28_from_r128(d, div);
-	bigint28_mul(c, a, b);
-	R128_U64 r[10];
-	R128_U64 m[5];
-	bigint28_div(r, m, c, d);
-	if (r[9] || r[8] || r[7] || r[6] || r[5] || r[4] > 0xFFFF) {
-		// Result too big to be represented in 128 bits
-		ret = R128_max;
-		mod = R128_zero;
-		return;
-	}
-	bigint28_to_r128(ret, r);
-	bigint28_to_r128(mod, m);
-}
-
-static void quotient_positive_mul2(R128 mul1, R128 mul2, R128 div, R128 &ret, R128 &mod) {
-	if (r128IsNeg(&mul1)) {
-		quotient_positive(-mul1, mul2, div, ret, mod);
-		ret = -ret;
-		if (mod > R128_zero) {
-			ret -= R128_smallest;
-			mod = div - mod;
+template <uint32_t digits1, uint32_t digits2>
+static void bigint28_div(int32_t r_out[digits1], int32_t r_mod[digits2], const int32_t p_in1[digits1], const int32_t p_in2[digits2]) {
+	DEV_ASSERT(bigint28_sign<digits2>(p_in2) > 0);
+	if (p_in1[digits1 - 1] < 0) {
+		int32_t in1_neg[digits1];
+		int32_t out_neg[digits1];
+		bigint28_neg<digits1>(in1_neg, p_in1);
+		bigint28_div_positive<digits1, digits2>(out_neg, r_mod, in1_neg, p_in2);
+		bigint28_neg<digits1>(r_out, out_neg);
+		if (bigint28_sign<digits2>(r_mod) > 0) {
+			int32_t mod[digits2];
+			bigint28_add1<digits1>(r_out);
+			bigint28_copy<digits2, digits2>(mod, p_in2);
+			bigint28_sub<digits2, digits2>(mod, r_mod);
+			bigint28_copy<digits2, digits2>(r_mod, mod);
 		}
-		return;
-	}
-	quotient_positive(mul1, mul2, div, ret, mod);
-}
-
-static void quotient(R128 mul1, R128 mul2, R128 div, R128 &ret, R128 &mod) {
-	if (r128IsNeg(&mul2)) {
-		quotient_positive_mul2(-mul1, -mul2, div, ret, mod);
-		return;
-	}
-	quotient_positive_mul2(mul1, mul2, div, ret, mod);
-}
-
-/**
- * Implements ((mul1 + mod1 / div) + (mul2 + mod2 / div) - (mul3 + mod3 / div)) / 2 where
- * 0 <= mod1 < div and 0 <= mod2 < div and 0 <= mod3 < div. The return value is in the
- * form ret + mod / div where 0 <= mod < div
- **/
-static void quotient_mid(R128 mul1, R128 mod1, R128 mul2, R128 mod2, R128 mul3, R128 mod3, R128 div, R128 &ret, R128 &mod) {
-	DEV_ASSERT(div > R128_zero);
-	mul1 += mul2;
-	mul1 -= mul3;
-	if (mod1 >= div - mod2) {
-		mod1 -= div - mod2;
-		mul1 += R128_smallest;
 	} else {
-		mod1 += mod2;
+		bigint28_div_positive<digits1, digits2>(r_out, r_mod, p_in1, p_in2);
 	}
-	if (mod1 < mod3) {
-		mod1 += div - mod3;
-		mul1 -= R128_smallest;
-	} else {
-		mod1 -= mod3;
-	}
-	if (mul1 & R128_smallest) {
-		mul1 -= R128_smallest;
-		mod1 += div;
-	}
-	r128Sar(&ret, &mul1, 1);
-	r128Shr(&mod, &mod1, 1);
-}
-
-/**
- * Implements (mul1 + mod1 / div) + (mul2 + mod2 / div) where 0 <= mod1 < div and
- * 0 <= mod2 < div. The return value is in the form ret + mod / div where 0 <= mod < div
- **/
-static void quotient_add(R128 mul1, R128 mod1, R128 mul2, R128 mod2, R128 div, R128 &ret, R128 &mod) {
-	DEV_ASSERT(div > R128_zero);
-	mul1 += mul2;
-	if (mod1 >= div - mod2) {
-		mod1 -= div - mod2;
-		mul1 += R128_smallest;
-	} else {
-		mod1 += mod2;
-	}
-	ret = mul1;
-	mod = mod1;
 }
 
 BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, bool p_winding_even_odd) {
@@ -521,18 +1251,32 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 			// Therefore, don't allow them as input.
 			continue;
 		}
-		R128 start_x = (p_edges[j].x - rect.position.x) / rect.size.x;
-		R128 start_y = (p_edges[j].y - rect.position.y) / rect.size.y;
-		R128 end_x = (p_edges[j + 1].x - rect.position.x) / rect.size.x;
-		R128 end_y = (p_edges[j + 1].y - rect.position.y) / rect.size.y;
-		if (start_x < end_x) {
+		int32_t start_x[5];
+		int32_t start_y[5];
+		int32_t end_x[5];
+		int32_t end_y[5];
+		bigint28_from_r128<5>(start_x, R128((p_edges[j].x - rect.position.x) / rect.size.x));
+		bigint28_from_r128<5>(start_y, R128((p_edges[j].y - rect.position.y) / rect.size.y));
+		bigint28_from_r128<5>(end_x, R128((p_edges[j + 1].x - rect.position.x) / rect.size.x));
+		bigint28_from_r128<5>(end_y, R128((p_edges[j + 1].y - rect.position.y) / rect.size.y));
+		int32_t check[5];
+		bigint28_copy<5, 5>(check, start_x);
+		bigint28_sub<5, 5>(check, end_x);
+		int sign = bigint28_sign<5>(check);
+		if (sign < 0) {
 			add_edge(add_point(add_slice(start_x), start_y), add_point(add_slice(end_x), end_y), p_winding[i]);
-		} else if (start_x > end_x) {
+		} else if (sign > 0) {
 			add_edge(add_point(add_slice(end_x), end_y), add_point(add_slice(start_x), start_y), -p_winding[i]);
-		} else if (start_y < end_y) {
-			add_vertical_edge(add_slice(start_x), start_y, end_y);
-		} else if (start_y > end_y) {
-			add_vertical_edge(add_slice(start_x), end_y, start_y);
+		} else {
+			int32_t check[5];
+			bigint28_copy<5, 5>(check, start_y);
+			bigint28_sub<5, 5>(check, end_y);
+			sign = bigint28_sign<5>(check);
+			if (sign < 0) {
+				add_vertical_edge(add_slice(start_x), start_y, end_y);
+			} else if (sign > 0) {
+				add_vertical_edge(add_slice(start_x), end_y, start_y);
+			}
 		}
 	}
 
@@ -548,16 +1292,16 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 			// Remove edges ending at this slice
 			uint32_t check_iter = list_nodes[slices[slice].check_list].next;
 			while (check_iter != slices[slice].check_list) {
-				DEV_ASSERT(edges[list_nodes[check_iter].element].x_next_check == slices[slice].x);
+				DEV_ASSERT(edges[list_nodes[check_iter].element].next_check == slice);
 				uint32_t check_iter_next = list_nodes[check_iter].next;
-				if (points[edges[list_nodes[check_iter].element].point_end].x == slices[slice].x) {
+				if (points[edges[list_nodes[check_iter].element].point_end].slice == slice) {
 					uint32_t treenode_edge_prev = tree_nodes[edges[list_nodes[check_iter].element].treenode_edges].current.prev;
 					if (treenode_edge_prev != edges_tree) {
-						edges[tree_nodes[treenode_edge_prev].element].x_next_check = slices[slice].x;
+						edges[tree_nodes[treenode_edge_prev].element].next_check = slice;
 						list_insert(edges[tree_nodes[treenode_edge_prev].element].listnode_check, slices[slice].check_list);
 					}
 					list_insert(edges[list_nodes[check_iter].element].listnode_incoming, incoming_list);
-					tree_remove(edges[list_nodes[check_iter].element].treenode_edges, slices[slice].x);
+					tree_remove(edges[list_nodes[check_iter].element].treenode_edges, slice);
 					list_remove(check_iter);
 				}
 				check_iter = check_iter_next;
@@ -575,13 +1319,22 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 				DEV_ASSERT(!verticals[tree_nodes[vertical_iter].element].is_start);
 				while (tree_nodes[treenode_edge].current.next != edges_tree) {
 					treenode_edge = tree_nodes[treenode_edge].current.next;
-					edge_calculate_y(tree_nodes[treenode_edge].element, slices[slice].x);
-					if (edges[tree_nodes[treenode_edge].element].y > verticals[tree_nodes[vertical_iter].element].y) {
+					int32_t cross1[10];
+					int32_t cross2[10];
+					const Edge &edge = edges[tree_nodes[treenode_edge].element];
+					bigint28_mul<5, 5>(cross1, verticals[tree_nodes[vertical_iter].element].y, edge.dir_x);
+					bigint28_mul<5, 5>(cross2, slices[slice].x, edge.dir_y);
+					bigint28_sub<10, 10>(cross1, cross2);
+					bigint28_sub<10, 10>(cross1, edge.cross);
+					if (bigint28_sign<10>(cross1) <= 0) {
 						break;
 					}
-					add_point(slice, edges[tree_nodes[treenode_edge].element].y);
+					int32_t y[5];
+					edge_intersect_x(y, tree_nodes[treenode_edge].element, slices[slice].x);
+					add_point(slice, y);
 					list_insert(edges[tree_nodes[treenode_edge].element].listnode_incoming, incoming_list);
 					list_insert(edges[tree_nodes[treenode_edge].element].listnode_outgoing, outgoing_list);
+					DEV_ASSERT(is_point_on_edge(add_point(slice, y), tree_nodes[treenode_edge].element, false));
 				}
 				vertical_iter = tree_nodes[vertical_iter].current.next;
 			}
@@ -591,13 +1344,13 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 			// Add edges starting at this slice
 			uint32_t check_iter = list_nodes[slices[slice].check_list].next;
 			while (check_iter != slices[slice].check_list) {
-				DEV_ASSERT(edges[list_nodes[check_iter].element].x_next_check == slices[slice].x);
-				if (points[edges[list_nodes[check_iter].element].point_start].x == slices[slice].x) {
+				DEV_ASSERT(edges[list_nodes[check_iter].element].next_check == slice);
+				if (points[edges[list_nodes[check_iter].element].point_start].slice == slice) {
 					uint32_t treenode_edge = get_edge_before_end(slices[slice].x, points[edges[list_nodes[check_iter].element].point_start].y, points[edges[list_nodes[check_iter].element].point_end].x, points[edges[list_nodes[check_iter].element].point_end].y);
 					list_insert(edges[list_nodes[check_iter].element].listnode_outgoing, outgoing_list);
-					tree_insert(edges[list_nodes[check_iter].element].treenode_edges, treenode_edge, slices[slice].x);
+					tree_insert(edges[list_nodes[check_iter].element].treenode_edges, treenode_edge, slice);
 					if (treenode_edge != edges_tree) {
-						edges[tree_nodes[treenode_edge].element].x_next_check = slices[slice].x;
+						edges[tree_nodes[treenode_edge].element].next_check = slice;
 						list_insert(edges[tree_nodes[treenode_edge].element].listnode_check, slices[slice].check_list);
 					}
 				}
@@ -607,101 +1360,73 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 
 		{
 			// Check order changes of edges, and mark as intersections
+			int32_t x[5];
+			bigint28_copy<5, 5>(x, slices[slice].x);
+			bigint28_add1<5>(x);
 			while (list_nodes[slices[slice].check_list].next != slices[slice].check_list) {
 				uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-				DEV_ASSERT(edges[edge].x_next_check == slices[slice].x);
-				DEV_ASSERT(points[edges[edge].point_end].x > slices[slice].x);
+				DEV_ASSERT(edges[edge].next_check == slice);
 				// Reset the next check of the checked edge to its end point.
 				// This will be reduced to the nearest intersection if one is found.
-				edges[edge].x_next_check = points[edges[edge].point_end].x;
+				edges[edge].next_check = points[edges[edge].point_end].slice;
 				list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
 				uint32_t treenode_edge_next = tree_nodes[edges[edge].treenode_edges].current.next;
 				if (treenode_edge_next == edges_tree) {
 					continue;
 				}
 				uint32_t edge_next = tree_nodes[treenode_edge_next].element;
-				edge_calculate_y(edge, slices[slice].x);
-				edge_calculate_y(edge_next, slices[slice].x);
-				DEV_ASSERT(edges[edge].y <= edges[edge_next].y);
-				if (edges[edge].y_next <= edges[edge_next].y_next) {
+				Edge &edge1 = edges[edge];
+				Edge &edge2 = edges[edge_next];
+				int32_t factor1[10];
+				int32_t total1[15];
+				int32_t factor2[10];
+				int32_t total2[15];
+				bigint28_mul<5, 5>(factor1, x, edge1.dir_y);
+				bigint28_add<10, 10>(factor1, edge1.cross);
+				bigint28_mul<10, 5>(total1, factor1, edge2.dir_x);
+				bigint28_mul<5, 5>(factor2, x, edge2.dir_y);
+				bigint28_add<10, 10>(factor2, edge2.cross);
+				bigint28_mul<10, 5>(total2, factor2, edge1.dir_x);
+				bigint28_sub<15, 15>(total2, total1);
+				if (total2[14] >= 0) {
 					continue;
 				}
-				if (edges[edge].y >= edges[edge].y_next) {
-					add_point(slice, edges[edge].y);
-				} else if (edges[edge_next].y <= edges[edge_next].y_next) {
-					add_point(slice, edges[edge_next].y);
-				} else {
-					R128 min_y = (edges[edge].y > edges[edge_next].y_next) ? edges[edge].y : edges[edge_next].y_next;
-					R128 max_y = (edges[edge].y_next < edges[edge_next].y) ? edges[edge].y_next : edges[edge_next].y;
-					add_point(slice, (min_y + max_y) >> 1);
-				}
+				int32_t y[5];
+				edge_intersect_edge(y, edge, edge_next);
+				add_point(slice, y);
 				if (tree_nodes[edges[edge].treenode_edges].self_value == 0) {
-					tree_remove(edges[edge].treenode_edges, slices[slice].x);
+					tree_remove(edges[edge].treenode_edges, slice);
 					list_insert(edges[edge].listnode_incoming, incoming_list);
 					list_insert(edges[edge_next].listnode_incoming, incoming_list);
 					list_insert(edges[edge_next].listnode_outgoing, outgoing_list);
 					list_remove(edges[edge].listnode_check);
 					uint32_t treenode_edge_prev = tree_nodes[treenode_edge_next].current.prev;
 					if (treenode_edge_prev != edges_tree) {
-						edges[tree_nodes[treenode_edge_prev].element].x_next_check = slices[slice].x;
+						edges[tree_nodes[treenode_edge_prev].element].next_check = slice;
 						list_insert(edges[tree_nodes[treenode_edge_prev].element].listnode_check, slices[slice].check_list);
 					}
 				} else if (tree_nodes[treenode_edge_next].self_value == 0) {
-					tree_remove(treenode_edge_next, slices[slice].x);
+					tree_remove(treenode_edge_next, slice);
 					list_insert(edges[edge].listnode_incoming, incoming_list);
 					list_insert(edges[edge_next].listnode_incoming, incoming_list);
 					list_insert(edges[edge].listnode_outgoing, outgoing_list);
 					list_remove(edges[edge_next].listnode_check);
-					edges[edge].x_next_check = slices[slice].x;
+					edges[edge].next_check = slice;
 					list_insert(edges[edge].listnode_check, slices[slice].check_list);
 				} else {
-					tree_swap(edges[edge].treenode_edges, treenode_edge_next, slices[slice].x);
+					tree_swap(edges[edge].treenode_edges, treenode_edge_next, slice);
 					list_insert(edges[edge].listnode_incoming, incoming_list);
 					list_insert(edges[edge_next].listnode_incoming, incoming_list);
 					list_insert(edges[edge].listnode_outgoing, outgoing_list);
 					list_insert(edges[edge_next].listnode_outgoing, outgoing_list);
-					edges[edge].x_next_check = slices[slice].x;
+					edges[edge].next_check = slice;
 					list_insert(edges[edge].listnode_check, slices[slice].check_list);
 					uint32_t treenode_edge_prev = tree_nodes[treenode_edge_next].current.prev;
 					if (treenode_edge_prev != edges_tree) {
-						edges[tree_nodes[treenode_edge_prev].element].x_next_check = slices[slice].x;
+						edges[tree_nodes[treenode_edge_prev].element].next_check = slice;
 						list_insert(edges[tree_nodes[treenode_edge_prev].element].listnode_check, slices[slice].check_list);
 					}
 				}
-			}
-		}
-
-		{
-			// Force edges going through a point to treat it as intersection
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				// Edges are currently sorted by y_next. To get their sorting by y, we need to
-				// use the previous tree
-				uint32_t treenode_edge = get_edge_before_previous(slices[slice].x, points[point].y);
-				if (tree_nodes[treenode_edge].version == slices[slice].x) {
-					treenode_edge = tree_nodes[treenode_edge].previous.next;
-				} else {
-					treenode_edge = tree_nodes[treenode_edge].current.next;
-				}
-				while (treenode_edge != edges_tree) {
-					edge_calculate_y(tree_nodes[treenode_edge].element, slices[slice].x);
-					DEV_ASSERT(edges[tree_nodes[treenode_edge].element].y >= points[point].y);
-					if (edges[tree_nodes[treenode_edge].element].y > points[point].y) {
-						break;
-					}
-					list_insert(edges[tree_nodes[treenode_edge].element].listnode_incoming, incoming_list);
-					if (tree_nodes[treenode_edge].current.parent != 0) {
-						// If the edge wasn't removed this slice, add outgoing too
-						list_insert(edges[tree_nodes[treenode_edge].element].listnode_outgoing, outgoing_list);
-					}
-					if (tree_nodes[treenode_edge].version == slices[slice].x) {
-						treenode_edge = tree_nodes[treenode_edge].previous.next;
-					} else {
-						treenode_edge = tree_nodes[treenode_edge].current.next;
-					}
-				}
-				point_iter = tree_nodes[point_iter].current.next;
 			}
 		}
 
@@ -710,16 +1435,96 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 			while (list_nodes[incoming_list].next != incoming_list) {
 				uint32_t edge = list_nodes[list_nodes[incoming_list].next].element;
 				list_remove(list_nodes[incoming_list].next);
-				tree_index_previous(edges[edge].treenode_edges, slices[slice].x);
-				edge_calculate_y(edge, slices[slice].x);
-				uint32_t treenode_point = get_point_or_before(slice, edges[edge].y);
-				DEV_ASSERT(treenode_point != slices[slice].points_tree || edges[edge].y < edges[edge].y_next);
-				if (treenode_point == slices[slice].points_tree || (edges[edge].y < edges[edge].y_next && points[tree_nodes[treenode_point].element].y < edges[edge].y)) {
+				tree_index_previous(edges[edge].treenode_edges, slice);
+				uint32_t treenode_point = get_point_before_edge(slice, edge, false);
+				if (treenode_point == slices[slice].points_tree) {
 					treenode_point = tree_nodes[treenode_point].current.next;
+				} else if (tree_nodes[treenode_point].current.next != slices[slice].points_tree && !is_point_on_edge(tree_nodes[treenode_point].element, edge, false)) {
+					int32_t check[5];
+					bigint28_copy<5, 5>(check, points[edges[edge].point_start].y);
+					bigint28_sub<5, 5>(check, points[edges[edge].point_end].y);
+					if (bigint28_sign<5>(check) < 0 || is_point_on_edge(tree_nodes[tree_nodes[treenode_point].current.next].element, edge, false)) {
+						treenode_point = tree_nodes[treenode_point].current.next;
+					}
 				}
 				DEV_ASSERT(treenode_point != slices[slice].points_tree);
-				DEV_ASSERT((edges[edge].y <= points[tree_nodes[treenode_point].element].y || points[tree_nodes[treenode_point].element].y <= edges[edge].y_next) || (edges[edge].y_next <= points[tree_nodes[treenode_point].element].y || points[tree_nodes[treenode_point].element].y <= edges[edge].y));
 				tree_insert(edges[edge].treenode_incoming, point_get_incoming_before(tree_nodes[treenode_point].element, tree_nodes[edges[edge].treenode_edges].index));
+			}
+		}
+
+		{
+			// Add outgoing edges to points
+			while (list_nodes[outgoing_list].next != outgoing_list) {
+				uint32_t edge = list_nodes[list_nodes[outgoing_list].next].element;
+				list_remove(list_nodes[outgoing_list].next);
+				tree_index(edges[edge].treenode_edges);
+				uint32_t treenode_point = get_point_before_edge(slice, edge, true);
+				if (treenode_point == slices[slice].points_tree) {
+					treenode_point = tree_nodes[treenode_point].current.next;
+				} else if (tree_nodes[treenode_point].current.next != slices[slice].points_tree && !is_point_on_edge(tree_nodes[treenode_point].element, edge, true)) {
+					int32_t check[5];
+					bigint28_copy<5, 5>(check, points[edges[edge].point_start].y);
+					bigint28_sub<5, 5>(check, points[edges[edge].point_end].y);
+					if (bigint28_sign<5>(check) > 0 || is_point_on_edge(tree_nodes[tree_nodes[treenode_point].current.next].element, edge, true)) {
+						treenode_point = tree_nodes[treenode_point].current.next;
+					}
+				}
+				DEV_ASSERT(treenode_point != slices[slice].points_tree);
+				tree_insert(edges[edge].treenode_outgoing, point_get_outgoing_before(tree_nodes[treenode_point].element, tree_nodes[edges[edge].treenode_edges].index));
+			}
+		}
+
+		{
+			// Erase unused points
+			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
+			while (point_iter != slices[slice].points_tree) {
+				uint32_t point = tree_nodes[point_iter].element;
+				uint32_t point_iter_next = tree_nodes[point_iter].current.next;
+				if (tree_nodes[points[point].incoming_tree].current.next == points[point].incoming_tree && tree_nodes[points[point].outgoing_tree].current.next == points[point].outgoing_tree) {
+					tree_remove(point_iter);
+				}
+				point_iter = point_iter_next;
+			}
+		}
+
+		{
+			// Force edges going through a point to treat it as intersection
+			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
+			while (point_iter != slices[slice].points_tree) {
+				uint32_t point = tree_nodes[point_iter].element;
+				// Edges are currently sorted by their y at the next x. To get their sorting
+				// by the y at the current x, we need to use the previous tree
+				uint32_t treenode_edge = get_edge_before_previous(slice, points[point].y);
+				// Find first edge coinciding with the point
+				while (treenode_edge != edges_tree && is_point_on_edge(point, tree_nodes[treenode_edge].element, false)) {
+					if (tree_nodes[treenode_edge].version == slice) {
+						treenode_edge = tree_nodes[treenode_edge].previous.prev;
+					} else {
+						treenode_edge = tree_nodes[treenode_edge].current.prev;
+					}
+				}
+				if (tree_nodes[treenode_edge].version == slice) {
+					treenode_edge = tree_nodes[treenode_edge].previous.next;
+				} else {
+					treenode_edge = tree_nodes[treenode_edge].current.next;
+				}
+				while (treenode_edge != edges_tree && is_point_on_edge(point, tree_nodes[treenode_edge].element, false)) {
+					if (tree_nodes[edges[tree_nodes[treenode_edge].element].treenode_incoming].current.parent == 0) {
+						tree_index_previous(treenode_edge, slice);
+						tree_insert(edges[tree_nodes[treenode_edge].element].treenode_incoming, point_get_incoming_before(point, tree_nodes[treenode_edge].index));
+					}
+					if (tree_nodes[treenode_edge].current.parent != 0 && tree_nodes[edges[tree_nodes[treenode_edge].element].treenode_outgoing].current.parent == 0) {
+						// If the edge wasn't removed this slice, add outgoing too
+						tree_index(treenode_edge);
+						tree_insert(edges[tree_nodes[treenode_edge].element].treenode_outgoing, point_get_outgoing_before(point, tree_nodes[treenode_edge].index));
+					}
+					if (tree_nodes[treenode_edge].version == slice) {
+						treenode_edge = tree_nodes[treenode_edge].previous.next;
+					} else {
+						treenode_edge = tree_nodes[treenode_edge].current.next;
+					}
+				}
+				point_iter = tree_nodes[point_iter].current.next;
 			}
 		}
 
@@ -734,20 +1539,20 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 				uint32_t treenode_edge_before;
 				if (tree_nodes[points[point].incoming_tree].current.next != points[point].incoming_tree) {
 					uint32_t treenode_edge_first = edges[tree_nodes[tree_nodes[points[point].incoming_tree].current.next].element].treenode_edges;
-					if (tree_nodes[treenode_edge_first].version == slices[slice].x) {
+					if (tree_nodes[treenode_edge_first].version == slice) {
 						treenode_edge_before = tree_nodes[treenode_edge_first].previous.prev;
 					} else {
 						treenode_edge_before = tree_nodes[treenode_edge_first].current.prev;
 					}
 				} else {
-					treenode_edge_before = get_edge_before_previous(slices[slice].x, points[point].y);
+					treenode_edge_before = get_edge_before_previous(slice, points[point].y);
 				}
 				if (treenode_edge_before == treenode_edge_previous) {
 					if (winding != 0 && (!p_winding_even_odd || (winding & 1))) {
 						DEV_ASSERT(treenode_edge_previous != edges_tree);
 						triangles.push_back(point_previous);
 						triangles.push_back(point);
-						if (tree_nodes[treenode_edge_previous].version == slices[slice].x) {
+						if (tree_nodes[treenode_edge_previous].version == slice) {
 							DEV_ASSERT(tree_nodes[treenode_edge_previous].previous.next != edges_tree);
 							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].previous.next].element].point_outgoing);
 						} else {
@@ -757,12 +1562,12 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 					}
 				} else {
 					treenode_edge_previous = treenode_edge_before;
-					winding = edge_get_winding_previous(treenode_edge_previous, slices[slice].x);
+					winding = edge_get_winding_previous(treenode_edge_previous, slice);
 					if (winding != 0 && (!p_winding_even_odd || (winding & 1))) {
 						DEV_ASSERT(treenode_edge_previous != edges_tree);
 						triangles.push_back(edges[tree_nodes[treenode_edge_previous].element].point_outgoing);
 						triangles.push_back(point);
-						if (tree_nodes[treenode_edge_previous].version == slices[slice].x) {
+						if (tree_nodes[treenode_edge_previous].version == slice) {
 							DEV_ASSERT(tree_nodes[treenode_edge_previous].previous.next != edges_tree);
 							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].previous.next].element].point_outgoing);
 						} else {
@@ -773,14 +1578,14 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 				}
 				uint32_t edge_incoming_iter = tree_nodes[points[point].incoming_tree].current.next;
 				while (edge_incoming_iter != points[point].incoming_tree) {
-					DEV_ASSERT(edges[tree_nodes[edge_incoming_iter].element].treenode_edges == (tree_nodes[treenode_edge_previous].version == slices[slice].x ? tree_nodes[treenode_edge_previous].previous.next : tree_nodes[treenode_edge_previous].current.next));
+					DEV_ASSERT(edges[tree_nodes[edge_incoming_iter].element].treenode_edges == (tree_nodes[treenode_edge_previous].version == slice ? tree_nodes[treenode_edge_previous].previous.next : tree_nodes[treenode_edge_previous].current.next));
 					treenode_edge_previous = edges[tree_nodes[edge_incoming_iter].element].treenode_edges;
 					winding += tree_nodes[treenode_edge_previous].self_value;
 					if (winding != 0 && (!p_winding_even_odd || (winding & 1))) {
 						DEV_ASSERT(treenode_edge_previous != edges_tree);
 						triangles.push_back(edges[tree_nodes[treenode_edge_previous].element].point_outgoing);
 						triangles.push_back(point);
-						if (tree_nodes[treenode_edge_previous].version == slices[slice].x) {
+						if (tree_nodes[treenode_edge_previous].version == slice) {
 							DEV_ASSERT(tree_nodes[treenode_edge_previous].previous.next != edges_tree);
 							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].previous.next].element].point_outgoing);
 						} else {
@@ -796,21 +1601,16 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 		}
 
 		{
-			// Add outgoing edges to points
-			while (list_nodes[outgoing_list].next != outgoing_list) {
-				uint32_t edge = list_nodes[list_nodes[outgoing_list].next].element;
-				list_remove(list_nodes[outgoing_list].next);
-				tree_index(edges[edge].treenode_edges);
-				edge_calculate_y(edge, slices[slice].x);
-				uint32_t treenode_point = get_point_or_before(slice, edges[edge].y_next);
-				DEV_ASSERT(treenode_point != slices[slice].points_tree || edges[edge].y > edges[edge].y_next);
-				if (treenode_point == slices[slice].points_tree || (edges[edge].y > edges[edge].y_next && points[tree_nodes[treenode_point].element].y < edges[edge].y_next)) {
-					treenode_point = tree_nodes[treenode_point].current.next;
+			// Set outgoing points for subsequent triangle production
+			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
+			while (point_iter != slices[slice].points_tree) {
+				uint32_t point = tree_nodes[point_iter].element;
+				uint32_t edge_outgoing_iter = tree_nodes[points[point].outgoing_tree].current.next;
+				while (edge_outgoing_iter != points[point].outgoing_tree) {
+					edges[tree_nodes[edge_outgoing_iter].element].point_outgoing = point;
+					edge_outgoing_iter = tree_nodes[edge_outgoing_iter].current.next;
 				}
-				DEV_ASSERT(treenode_point != slices[slice].points_tree);
-				DEV_ASSERT((edges[edge].y <= points[tree_nodes[treenode_point].element].y || points[tree_nodes[treenode_point].element].y <= edges[edge].y_next) || (edges[edge].y_next <= points[tree_nodes[treenode_point].element].y || points[tree_nodes[treenode_point].element].y <= edges[edge].y));
-				tree_insert(edges[edge].treenode_outgoing, point_get_outgoing_before(tree_nodes[treenode_point].element, tree_nodes[edges[edge].treenode_edges].index));
-				edges[edge].point_outgoing = tree_nodes[treenode_point].element;
+				point_iter = tree_nodes[point_iter].current.next;
 			}
 		}
 
@@ -826,7 +1626,10 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 					uint32_t treenode_edge_before = get_edge_before(slices[slice].x, points[point].y);
 					if (treenode_edge_before != edges_tree && tree_nodes[treenode_edge_before].current.next != edges_tree) {
 						DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-						if (points[edges[tree_nodes[treenode_edge_before].element].point_end].x < points[edges[tree_nodes[tree_nodes[treenode_edge_before].current.next].element].point_end].x) {
+						int32_t check[5];
+						bigint28_copy<5, 5>(check, points[edges[tree_nodes[treenode_edge_before].element].point_end].x);
+						bigint28_sub<5, 5>(check, points[edges[tree_nodes[tree_nodes[treenode_edge_before].current.next].element].point_end].x);
+						if (bigint28_sign<5>(check) < 0) {
 							add_edge(point, edges[tree_nodes[treenode_edge_before].element].point_end, 0);
 						} else {
 							add_edge(point, edges[tree_nodes[tree_nodes[treenode_edge_before].current.next].element].point_end, 0);
@@ -835,9 +1638,9 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 						// Remove it, and add it to the point's outgoing edges.
 						DEV_ASSERT(list_nodes[slices[slice].check_list].next != slices[slice].check_list);
 						uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-						tree_insert(edges[edge].treenode_edges, treenode_edge_before, slices[slice].x);
+						tree_insert(edges[edge].treenode_edges, treenode_edge_before, slice);
 						tree_insert(edges[edge].treenode_outgoing, points[point].outgoing_tree);
-						edges[edge].x_next_check = points[edges[edge].point_end].x;
+						edges[edge].next_check = points[edges[edge].point_end].slice;
 						list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
 						DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
 					}
@@ -852,18 +1655,34 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 						if (treenode_edge_other != edges_tree) {
 							uint32_t point_edge_end = edges[edge_first].point_end;
 							uint32_t point_other_outgoing = edges[tree_nodes[treenode_edge_other].element].point_outgoing;
-							R128 a_x = points[point].x - points[point_other_outgoing].x;
-							R128 a_y = points[point].y - points[point_other_outgoing].y;
-							R128 b_x = points[point_edge_end].x - points[point_other_outgoing].x;
-							R128 b_y = points[point_edge_end].y - points[point_other_outgoing].y;
-							if (a_x * b_y > a_y * b_x) {
+							int32_t a_x[5];
+							int32_t a_y[5];
+							int32_t b_x[5];
+							int32_t b_y[5];
+							bigint28_copy<5, 5>(a_x, points[point].x);
+							bigint28_sub<5, 5>(a_x, points[point_other_outgoing].x);
+							bigint28_copy<5, 5>(a_y, points[point].y);
+							bigint28_sub<5, 5>(a_y, points[point_other_outgoing].y);
+							bigint28_copy<5, 5>(b_x, points[point_edge_end].x);
+							bigint28_sub<5, 5>(b_x, points[point_other_outgoing].x);
+							bigint28_copy<5, 5>(b_y, points[point_edge_end].y);
+							bigint28_sub<5, 5>(b_y, points[point_other_outgoing].y);
+							int32_t cross1[10];
+							int32_t cross2[10];
+							bigint28_mul<5, 5>(cross1, a_x, b_y);
+							bigint28_mul<5, 5>(cross2, a_y, b_x);
+							bigint28_sub<10, 10>(cross1, cross2);
+							// Perfect accuracy isn't needed here. Getting it "wrong" will simply
+							// result in either a near-line-like flipped triangle, or at most one
+							// unnecessary vertex
+							if (bigint28_sign<10>(cross1) > 0) {
 								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
 								add_edge(point, edges[tree_nodes[treenode_edge_other].element].point_end, 0);
 								DEV_ASSERT(list_nodes[slices[slice].check_list].next != slices[slice].check_list);
 								uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-								tree_insert(edges[edge].treenode_edges, treenode_edge_other, slices[slice].x);
+								tree_insert(edges[edge].treenode_edges, treenode_edge_other, slice);
 								tree_insert(edges[edge].treenode_outgoing, points[point].outgoing_tree);
-								edges[edge].x_next_check = points[edges[edge].point_end].x;
+								edges[edge].next_check = points[edges[edge].point_end].slice;
 								list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
 								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
 							}
@@ -875,18 +1694,34 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 						if (treenode_edge_other != edges_tree) {
 							uint32_t point_edge_end = edges[edge_last].point_end;
 							uint32_t point_other_outgoing = edges[tree_nodes[treenode_edge_other].element].point_outgoing;
-							R128 a_x = points[point].x - points[point_other_outgoing].x;
-							R128 a_y = points[point].y - points[point_other_outgoing].y;
-							R128 b_x = points[point_edge_end].x - points[point_other_outgoing].x;
-							R128 b_y = points[point_edge_end].y - points[point_other_outgoing].y;
-							if (a_x * b_y < a_y * b_x) {
+							int32_t a_x[5];
+							int32_t a_y[5];
+							int32_t b_x[5];
+							int32_t b_y[5];
+							bigint28_copy<5, 5>(a_x, points[point].x);
+							bigint28_sub<5, 5>(a_x, points[point_other_outgoing].x);
+							bigint28_copy<5, 5>(a_y, points[point].y);
+							bigint28_sub<5, 5>(a_y, points[point_other_outgoing].y);
+							bigint28_copy<5, 5>(b_x, points[point_edge_end].x);
+							bigint28_sub<5, 5>(b_x, points[point_other_outgoing].x);
+							bigint28_copy<5, 5>(b_y, points[point_edge_end].y);
+							bigint28_sub<5, 5>(b_y, points[point_other_outgoing].y);
+							int32_t cross1[10];
+							int32_t cross2[10];
+							bigint28_mul<5, 5>(cross1, a_x, b_y);
+							bigint28_mul<5, 5>(cross2, a_y, b_x);
+							bigint28_sub<10, 10>(cross1, cross2);
+							// Perfect accuracy isn't needed here. Getting it "wrong" will simply
+							// result in either a near-line-like flipped triangle, or at most one
+							// unnecessary vertex
+							if (bigint28_sign<10>(cross1) < 0) {
 								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
 								add_edge(point, edges[tree_nodes[treenode_edge_other].element].point_end, 0);
 								DEV_ASSERT(list_nodes[slices[slice].check_list].next != slices[slice].check_list);
 								uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-								tree_insert(edges[edge].treenode_edges, edges[edge_last].treenode_edges, slices[slice].x);
+								tree_insert(edges[edge].treenode_edges, edges[edge_last].treenode_edges, slice);
 								tree_insert(edges[edge].treenode_outgoing, edges[edge_last].treenode_outgoing);
-								edges[edge].x_next_check = points[edges[edge].point_end].x;
+								edges[edge].next_check = points[edges[edge].point_end].slice;
 								list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
 								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
 							}
@@ -906,13 +1741,13 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 					{
 						uint32_t treenode_edge = tree_nodes[edges[tree_nodes[tree_nodes[points[point].outgoing_tree].current.next].element].treenode_edges].current.prev;
 						if (treenode_edge != edges_tree) {
-							check_intersection(treenode_edge, slices[slice].x + R128_smallest);
+							check_intersection(treenode_edge);
 						}
 					}
 					{
 						uint32_t treenode_edge = edges[tree_nodes[tree_nodes[points[point].outgoing_tree].current.prev].element].treenode_edges;
 						if (tree_nodes[treenode_edge].current.next != edges_tree) {
-							check_intersection(treenode_edge, slices[slice].x + R128_smallest);
+							check_intersection(treenode_edge);
 						}
 					}
 				}
@@ -954,7 +1789,7 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 		}
 		for (uint32_t j = 0; j < 3; i++, j++) {
 			if (!points[triangles[i]].used) {
-				out_points.push_back(Vector2(static_cast<double>(points[triangles[i]].x) * rect.size.x + rect.position.x, static_cast<double>(points[triangles[i]].y) * rect.size.y + rect.position.y));
+				out_points.push_back(Vector2(static_cast<double>(bigint28_to_r128<5>(points[triangles[i]].x)) * rect.size.x + rect.position.x, static_cast<double>(bigint28_to_r128<5>(points[triangles[i]].y)) * rect.size.y + rect.position.y));
 				points[triangles[i]].used = out_points.size();
 			}
 			out_triangles.push_back(points[triangles[i]].used - 1);
@@ -962,13 +1797,16 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 	}
 }
 
-uint32_t BentleyOttmann::add_slice(R128 p_x) {
+uint32_t BentleyOttmann::add_slice(const int32_t p_x[5]) {
 	uint32_t insert_after = slices_tree;
 	uint32_t current = tree_nodes[slices_tree].current.right;
 	if (current) {
 		while (true) {
-			R128 x = slices[tree_nodes[current].element].x;
-			if (p_x < x) {
+			int32_t x[5];
+			bigint28_copy<5, 5>(x, p_x);
+			bigint28_sub<5, 5>(x, slices[tree_nodes[current].element].x);
+			int sign = bigint28_sign<5>(x);
+			if (sign < 0) {
 				if (tree_nodes[current].current.left) {
 					current = tree_nodes[current].current.left;
 					continue;
@@ -976,7 +1814,7 @@ uint32_t BentleyOttmann::add_slice(R128 p_x) {
 				insert_after = tree_nodes[current].current.prev;
 				break;
 			}
-			if (p_x > x) {
+			if (sign > 0) {
 				if (tree_nodes[current].current.right) {
 					current = tree_nodes[current].current.right;
 					continue;
@@ -988,7 +1826,7 @@ uint32_t BentleyOttmann::add_slice(R128 p_x) {
 		}
 	}
 	Slice slice;
-	slice.x = p_x;
+	bigint28_copy<5, 5>(slice.x, p_x);
 	slice.points_tree = tree_create();
 	slice.vertical_tree = tree_create();
 	slice.check_list = list_create();
@@ -997,13 +1835,16 @@ uint32_t BentleyOttmann::add_slice(R128 p_x) {
 	return slices.size() - 1;
 }
 
-uint32_t BentleyOttmann::add_point(uint32_t p_slice, R128 p_y) {
+uint32_t BentleyOttmann::add_point(uint32_t p_slice, const int32_t p_y[5]) {
 	uint32_t insert_after = slices[p_slice].points_tree;
 	uint32_t current = tree_nodes[slices[p_slice].points_tree].current.right;
 	if (current) {
 		while (true) {
-			R128 y = points[tree_nodes[current].element].y;
-			if (p_y < y) {
+			int32_t y[5];
+			bigint28_copy<5, 5>(y, p_y);
+			bigint28_sub<5, 5>(y, points[tree_nodes[current].element].y);
+			int sign = bigint28_sign<5>(y);
+			if (sign < 0) {
 				if (tree_nodes[current].current.left) {
 					current = tree_nodes[current].current.left;
 					continue;
@@ -1011,7 +1852,7 @@ uint32_t BentleyOttmann::add_point(uint32_t p_slice, R128 p_y) {
 				insert_after = tree_nodes[current].current.prev;
 				break;
 			}
-			if (p_y > y) {
+			if (sign > 0) {
 				if (tree_nodes[current].current.right) {
 					current = tree_nodes[current].current.right;
 					continue;
@@ -1024,8 +1865,8 @@ uint32_t BentleyOttmann::add_point(uint32_t p_slice, R128 p_y) {
 	}
 	Point point;
 	point.slice = p_slice;
-	point.x = slices[p_slice].x;
-	point.y = p_y;
+	bigint28_copy<5, 5>(point.x, slices[p_slice].x);
+	bigint28_copy<5, 5>(point.y, p_y);
 	point.incoming_tree = tree_create();
 	point.outgoing_tree = tree_create();
 	tree_insert(tree_create(points.size()), insert_after);
@@ -1033,26 +1874,58 @@ uint32_t BentleyOttmann::add_point(uint32_t p_slice, R128 p_y) {
 	return points.size() - 1;
 }
 
-uint32_t BentleyOttmann::get_point_or_before(uint32_t p_slice, R128 p_y) {
+uint32_t BentleyOttmann::get_point_before_edge(uint32_t p_slice, uint32_t p_edge, bool p_next_x) {
 	uint32_t current = tree_nodes[slices[p_slice].points_tree].current.right;
 	if (!current) {
 		return slices[p_slice].points_tree;
 	}
+	const Edge &edge = edges[p_edge];
+	int32_t x[5];
+	bigint28_copy<5, 5>(x, slices[p_slice].x);
+	if (p_next_x) {
+		bigint28_add1<5>(x);
+	}
 	while (true) {
-		R128 y = points[tree_nodes[current].element].y;
-		if (p_y < y) {
+		int32_t cross1[10];
+		int32_t cross2[10];
+		bigint28_mul<5, 5>(cross1, points[tree_nodes[current].element].y, edge.dir_x);
+		bigint28_mul<5, 5>(cross2, x, edge.dir_y);
+		bigint28_sub<10, 10>(cross1, cross2);
+		bigint28_sub<10, 10>(cross1, edge.cross);
+		int sign = bigint28_sign<10>(cross1);
+		if (sign > 0) {
 			if (tree_nodes[current].current.left) {
 				current = tree_nodes[current].current.left;
 				continue;
 			}
 			return tree_nodes[current].current.prev;
 		}
-		if (p_y > y && tree_nodes[current].current.right) {
+		if (sign < 0 && tree_nodes[current].current.right) {
 			current = tree_nodes[current].current.right;
 			continue;
 		}
 		return current;
 	}
+}
+
+bool BentleyOttmann::is_point_on_edge(uint32_t p_point, uint32_t p_edge, bool p_next_x) {
+	const Edge &edge = edges[p_edge];
+	int32_t x[5];
+	bigint28_copy<5, 5>(x, points[p_point].x);
+	if (p_next_x) {
+		bigint28_add1<5>(x);
+	}
+	int32_t cross1[10];
+	int32_t cross2[10];
+	bigint28_mul<5, 5>(cross1, points[p_point].y, edge.dir_x);
+	bigint28_mul<5, 5>(cross2, x, edge.dir_y);
+	bigint28_sub<10, 10>(cross1, cross2);
+	bigint28_sub<10, 10>(cross1, edge.cross);
+	bigint28_shl1<10>(cross1);
+	bigint28_copy<10, 10>(cross2, cross1);
+	bigint28_sub<10, 5>(cross1, edge.dir_x);
+	bigint28_add<10, 5>(cross2, edge.dir_x);
+	return bigint28_sign<10>(cross1) <= 0 && bigint28_sign<10>(cross2) > 0;
 }
 
 uint32_t BentleyOttmann::point_get_incoming_before(uint32_t p_point, uint32_t p_index) {
@@ -1100,7 +1973,6 @@ uint32_t BentleyOttmann::point_get_outgoing_before(uint32_t p_point, uint32_t p_
 }
 
 void BentleyOttmann::add_edge(uint32_t p_point_start, uint32_t p_point_end, int p_winding) {
-	DEV_ASSERT(points[p_point_start].x < points[p_point_end].x);
 	Edge edge;
 	edge.point_start = edge.point_outgoing = p_point_start;
 	edge.point_end = p_point_end;
@@ -1110,40 +1982,44 @@ void BentleyOttmann::add_edge(uint32_t p_point_start, uint32_t p_point_end, int 
 	edge.listnode_incoming = list_create(edges.size());
 	edge.listnode_outgoing = list_create(edges.size());
 	edge.listnode_check = list_create(edges.size());
-	R128 start_x = points[p_point_start].x;
-	R128 start_y = points[p_point_start].y;
-	edge.dir_x = points[p_point_end].x - start_x;
-	edge.dir_y = points[p_point_end].y - start_y;
-	edge.x_next_check = start_x;
-	edge.x_last_calculate = start_x;
-	edge.y = start_y;
-	quotient(R128_smallest, edge.dir_y, edge.dir_x, edge.step_y, edge.step_mod);
-	quotient_add(start_y, R128_zero, edge.step_y, edge.step_mod, edge.dir_x, edge.y_next, R128());
+	int32_t cross[10];
+	bigint28_copy<5, 5>(edge.dir_x, points[p_point_end].x);
+	bigint28_copy<5, 5>(edge.dir_y, points[p_point_end].y);
+	bigint28_sub<5, 5>(edge.dir_x, points[p_point_start].x);
+	bigint28_sub<5, 5>(edge.dir_y, points[p_point_start].y);
+	DEV_ASSERT(bigint28_sign<5>(edge.dir_x) > 0);
+	edge.next_check = points[p_point_start].slice;
+	bigint28_mul<5, 5>(edge.cross, points[p_point_start].y, edge.dir_x);
+	bigint28_mul<5, 5>(cross, points[p_point_start].x, edge.dir_y);
+	bigint28_sub<10, 10>(edge.cross, cross);
 	edges.push_back(edge);
 	list_insert(edge.listnode_check, slices[points[p_point_start].slice].check_list);
 }
 
-void BentleyOttmann::add_vertical_edge(uint32_t p_slice, R128 p_y_start, R128 p_y_end) {
+void BentleyOttmann::add_vertical_edge(uint32_t p_slice, const int32_t p_y_start[5], const int32_t p_y_end[5]) {
 	uint32_t start;
 	uint32_t current = tree_nodes[slices[p_slice].vertical_tree].current.right;
 	if (!current) {
 		Vertical vertical;
-		vertical.y = p_y_start;
+		bigint28_copy<5, 5>(vertical.y, p_y_start);
 		vertical.is_start = true;
 		start = tree_create(verticals.size());
 		verticals.push_back(vertical);
 		tree_insert(start, slices[p_slice].vertical_tree);
 	} else {
 		while (true) {
-			R128 y = verticals[tree_nodes[current].element].y;
-			if (p_y_start < y) {
+			int32_t y[5];
+			bigint28_copy<5, 5>(y, p_y_start);
+			bigint28_sub<5, 5>(y, verticals[tree_nodes[current].element].y);
+			int sign = bigint28_sign<5>(y);
+			if (sign < 0) {
 				if (tree_nodes[current].current.left) {
 					current = tree_nodes[current].current.left;
 					continue;
 				}
 				if (verticals[tree_nodes[current].element].is_start) {
 					Vertical vertical;
-					vertical.y = p_y_start;
+					bigint28_copy<5, 5>(vertical.y, p_y_start);
 					vertical.is_start = true;
 					start = tree_create(verticals.size());
 					verticals.push_back(vertical);
@@ -1153,14 +2029,14 @@ void BentleyOttmann::add_vertical_edge(uint32_t p_slice, R128 p_y_start, R128 p_
 				}
 				break;
 			}
-			if (p_y_start > y) {
+			if (sign > 0) {
 				if (tree_nodes[current].current.right) {
 					current = tree_nodes[current].current.right;
 					continue;
 				}
 				if (!verticals[tree_nodes[current].element].is_start) {
 					Vertical vertical;
-					vertical.y = p_y_start;
+					bigint28_copy<5, 5>(vertical.y, p_y_start);
 					vertical.is_start = true;
 					start = tree_create(verticals.size());
 					verticals.push_back(vertical);
@@ -1178,47 +2054,87 @@ void BentleyOttmann::add_vertical_edge(uint32_t p_slice, R128 p_y_start, R128 p_
 			break;
 		}
 	}
-	while (tree_nodes[start].current.next != slices[p_slice].vertical_tree && (verticals[tree_nodes[tree_nodes[start].current.next].element].y > p_y_end || (verticals[tree_nodes[tree_nodes[start].current.next].element].y == p_y_end && verticals[tree_nodes[tree_nodes[start].current.next].element].is_start))) {
+	while (tree_nodes[start].current.next != slices[p_slice].vertical_tree) {
+		int32_t y[5];
+		bigint28_copy<5, 5>(y, p_y_end);
+		bigint28_sub<5, 5>(y, verticals[tree_nodes[tree_nodes[start].current.next].element].y);
+		int sign = bigint28_sign<5>(y);
+		if (sign < 0 || (sign == 0 && !verticals[tree_nodes[tree_nodes[start].current.next].element].is_start)) {
+			break;
+		}
 		tree_remove(tree_nodes[start].current.next);
 	}
 	if (tree_nodes[start].current.next == slices[p_slice].vertical_tree || verticals[tree_nodes[tree_nodes[start].current.next].element].is_start) {
 		Vertical vertical;
-		vertical.y = p_y_end;
+		bigint28_copy<5, 5>(vertical.y, p_y_end);
 		vertical.is_start = false;
 		tree_insert(tree_create(verticals.size()), start);
 		verticals.push_back(vertical);
 	}
 }
 
-void BentleyOttmann::edge_calculate_y(uint32_t p_edge, R128 p_x) {
-	if (edges[p_edge].x_last_calculate == p_x) {
-		return;
+void BentleyOttmann::edge_intersect_x(int32_t r_y[5], uint32_t p_edge, const int32_t p_x[5]) {
+	const Edge &edge = edges[p_edge];
+	int32_t total[10];
+	int32_t y[10];
+	int32_t mod[5];
+	bigint28_mul<5, 5>(total, p_x, edge.dir_y);
+	bigint28_add<10, 10>(total, edge.cross);
+	bigint28_div<10, 5>(y, mod, total, edge.dir_x);
+	bigint28_shl1<5>(mod);
+	bigint28_sub<5, 5>(mod, edge.dir_x);
+	if (mod[4] >= 0) {
+		bigint28_add1<10>(y);
 	}
-	edges[p_edge].x_last_calculate = p_x;
-	R128 start_x = points[edges[p_edge].point_start].x;
-	R128 start_y = points[edges[p_edge].point_start].y;
-	R128 mod;
-	quotient(p_x - start_x, edges[p_edge].dir_y, edges[p_edge].dir_x, edges[p_edge].y, mod);
-	edges[p_edge].y += start_y;
-	quotient_add(edges[p_edge].y, mod, edges[p_edge].step_y, edges[p_edge].step_mod, edges[p_edge].dir_x, edges[p_edge].y_next, R128());
+	bigint28_copy<5, 10>(r_y, y);
 }
 
-uint32_t BentleyOttmann::get_edge_before(R128 p_x, R128 p_y) {
+void BentleyOttmann::edge_intersect_edge(int32_t r_y[5], uint32_t p_edge1, uint32_t p_edge2) {
+	const Edge &edge1 = edges[p_edge1];
+	const Edge &edge2 = edges[p_edge2];
+	int32_t total1[15];
+	int32_t total2[15];
+	int32_t factor1[10];
+	int32_t factor2[10];
+	int32_t y[15];
+	int32_t mod[10];
+	bigint28_mul<10, 5>(total1, edge1.cross, edge2.dir_y);
+	bigint28_mul<10, 5>(total2, edge2.cross, edge1.dir_y);
+	bigint28_sub<15, 15>(total2, total1);
+	bigint28_mul<5, 5>(factor1, edge1.dir_y, edge2.dir_x);
+	bigint28_mul<5, 5>(factor2, edge2.dir_y, edge1.dir_x);
+	bigint28_sub<10, 10>(factor1, factor2);
+	bigint28_div<15, 10>(y, mod, total2, factor1);
+	bigint28_shl1<10>(mod);
+	bigint28_sub<10, 10>(mod, factor1);
+	if (mod[9] >= 0) {
+		bigint28_add1<15>(y);
+	}
+	bigint28_copy<5, 15>(r_y, y);
+}
+
+uint32_t BentleyOttmann::get_edge_before(const int32_t p_x[5], const int32_t p_y[5]) {
 	uint32_t current = tree_nodes[edges_tree].current.right;
 	if (!current) {
 		return edges_tree;
 	}
 	while (true) {
-		edge_calculate_y(tree_nodes[current].element, p_x);
-		R128 y = edges[tree_nodes[current].element].y;
-		if (p_y > y) {
+		int32_t cross1[10];
+		int32_t cross2[10];
+		const Edge &edge = edges[tree_nodes[current].element];
+		bigint28_mul<5, 5>(cross1, p_y, edge.dir_x);
+		bigint28_mul<5, 5>(cross2, p_x, edge.dir_y);
+		bigint28_sub<10, 10>(cross1, cross2);
+		bigint28_sub<10, 10>(cross1, edge.cross);
+		int sign = bigint28_sign<10>(cross1);
+		if (sign > 0) {
 			if (tree_nodes[current].current.right) {
 				current = tree_nodes[current].current.right;
 				continue;
 			}
 			return current;
 		}
-		if (p_y < y && tree_nodes[current].current.left) {
+		if (sign < 0 && tree_nodes[current].current.left) {
 			current = tree_nodes[current].current.left;
 			continue;
 		}
@@ -1226,24 +2142,34 @@ uint32_t BentleyOttmann::get_edge_before(R128 p_x, R128 p_y) {
 	}
 }
 
-uint32_t BentleyOttmann::get_edge_before_end(R128 p_x, R128 p_y, R128 p_end_x, R128 p_end_y) {
-	R128 a_x = p_end_x - p_x;
-	R128 a_y = p_end_y - p_y;
+uint32_t BentleyOttmann::get_edge_before_end(const int32_t p_x[5], const int32_t p_y[5], const int32_t p_end_x[5], const int32_t p_end_y[5]) {
 	uint32_t current = tree_nodes[edges_tree].current.right;
 	if (!current) {
 		return edges_tree;
 	}
+	int32_t a_x[5];
+	int32_t a_y[5];
+	bigint28_copy<5, 5>(a_x, p_end_x);
+	bigint28_copy<5, 5>(a_y, p_end_y);
+	bigint28_sub<5, 5>(a_x, p_x);
+	bigint28_sub<5, 5>(a_y, p_y);
 	while (true) {
-		edge_calculate_y(tree_nodes[current].element, p_x);
-		R128 y = edges[tree_nodes[current].element].y;
-		if (p_y > y) {
+		int32_t cross1[10];
+		int32_t cross2[10];
+		const Edge &edge = edges[tree_nodes[current].element];
+		bigint28_mul<5, 5>(cross1, p_y, edge.dir_x);
+		bigint28_mul<5, 5>(cross2, p_x, edge.dir_y);
+		bigint28_sub<10, 10>(cross1, cross2);
+		bigint28_sub<10, 10>(cross1, edge.cross);
+		int sign = bigint28_sign<10>(cross1);
+		if (sign > 0) {
 			if (tree_nodes[current].current.right) {
 				current = tree_nodes[current].current.right;
 				continue;
 			}
 			return current;
 		}
-		if (p_y < y) {
+		if (sign < 0) {
 			if (tree_nodes[current].current.left) {
 				current = tree_nodes[current].current.left;
 				continue;
@@ -1252,16 +2178,24 @@ uint32_t BentleyOttmann::get_edge_before_end(R128 p_x, R128 p_y, R128 p_end_x, R
 		}
 		// This is a best-effort attempt, since edges are not guaranteed
 		// to be sorted by end.
-		R128 b_x = points[edges[tree_nodes[current].element].point_end].x - p_x;
-		R128 b_y = points[edges[tree_nodes[current].element].point_end].y - p_y;
-		if (b_x * a_y > b_y * a_x) {
+		int32_t b_x[5];
+		int32_t b_y[5];
+		bigint28_copy<5, 5>(b_x, points[edges[tree_nodes[current].element].point_end].x);
+		bigint28_copy<5, 5>(b_y, points[edges[tree_nodes[current].element].point_end].y);
+		bigint28_sub<5, 5>(b_x, p_x);
+		bigint28_sub<5, 5>(b_y, p_y);
+		bigint28_mul<5, 5>(cross1, a_y, b_x);
+		bigint28_mul<5, 5>(cross2, a_x, b_y);
+		bigint28_sub<10, 10>(cross1, cross2);
+		sign = bigint28_sign<10>(cross1);
+		if (sign > 0) {
 			if (tree_nodes[current].current.right) {
 				current = tree_nodes[current].current.right;
 				continue;
 			}
 			return current;
 		}
-		if (b_x * a_y < b_y * a_x && tree_nodes[current].current.left) {
+		if (sign < 0 && tree_nodes[current].current.left) {
 			current = tree_nodes[current].current.left;
 			continue;
 		}
@@ -1269,9 +2203,9 @@ uint32_t BentleyOttmann::get_edge_before_end(R128 p_x, R128 p_y, R128 p_end_x, R
 	}
 }
 
-uint32_t BentleyOttmann::get_edge_before_previous(R128 p_x, R128 p_y) {
+uint32_t BentleyOttmann::get_edge_before_previous(uint32_t p_slice, const int32_t p_y[5]) {
 	uint32_t current;
-	if (tree_nodes[edges_tree].version == p_x) {
+	if (tree_nodes[edges_tree].version == p_slice) {
 		current = tree_nodes[edges_tree].previous.right;
 	} else {
 		current = tree_nodes[edges_tree].current.right;
@@ -1280,10 +2214,16 @@ uint32_t BentleyOttmann::get_edge_before_previous(R128 p_x, R128 p_y) {
 		return edges_tree;
 	}
 	while (true) {
-		edge_calculate_y(tree_nodes[current].element, p_x);
-		R128 y = edges[tree_nodes[current].element].y;
-		if (p_y > y) {
-			if (tree_nodes[current].version == p_x) {
+		int32_t cross1[10];
+		int32_t cross2[10];
+		const Edge &edge = edges[tree_nodes[current].element];
+		bigint28_mul<5, 5>(cross1, p_y, edge.dir_x);
+		bigint28_mul<5, 5>(cross2, slices[p_slice].x, edge.dir_y);
+		bigint28_sub<10, 10>(cross1, cross2);
+		bigint28_sub<10, 10>(cross1, edge.cross);
+		int sign = bigint28_sign<10>(cross1);
+		if (sign > 0) {
+			if (tree_nodes[current].version == p_slice) {
 				if (tree_nodes[current].previous.right) {
 					current = tree_nodes[current].previous.right;
 					continue;
@@ -1296,14 +2236,14 @@ uint32_t BentleyOttmann::get_edge_before_previous(R128 p_x, R128 p_y) {
 			}
 			return current;
 		}
-		if (tree_nodes[current].version == p_x) {
-			if (p_y < y && tree_nodes[current].previous.left) {
+		if (tree_nodes[current].version == p_slice) {
+			if (sign < 0 && tree_nodes[current].previous.left) {
 				current = tree_nodes[current].previous.left;
 				continue;
 			}
 			return tree_nodes[current].previous.prev;
 		} else {
-			if (p_y < y && tree_nodes[current].current.left) {
+			if (sign < 0 && tree_nodes[current].current.left) {
 				current = tree_nodes[current].current.left;
 				continue;
 			}
@@ -1312,29 +2252,29 @@ uint32_t BentleyOttmann::get_edge_before_previous(R128 p_x, R128 p_y) {
 	}
 }
 
-int BentleyOttmann::edge_get_winding_previous(uint32_t p_treenode_edge, R128 p_x) {
+int BentleyOttmann::edge_get_winding_previous(uint32_t p_treenode_edge, uint32_t p_version) {
 	int winding = tree_nodes[p_treenode_edge].self_value;
 	uint32_t current = p_treenode_edge;
 	uint32_t parent;
-	if (tree_nodes[p_treenode_edge].version == p_x) {
+	if (tree_nodes[p_treenode_edge].version == p_version) {
 		parent = tree_nodes[p_treenode_edge].previous.parent;
-		if (tree_nodes[tree_nodes[p_treenode_edge].previous.left].version == p_x) {
+		if (tree_nodes[tree_nodes[p_treenode_edge].previous.left].version == p_version) {
 			winding += tree_nodes[tree_nodes[p_treenode_edge].previous.left].previous.sum_value;
 		} else {
 			winding += tree_nodes[tree_nodes[p_treenode_edge].previous.left].current.sum_value;
 		}
 	} else {
 		parent = tree_nodes[p_treenode_edge].current.parent;
-		if (tree_nodes[tree_nodes[p_treenode_edge].current.left].version == p_x) {
+		if (tree_nodes[tree_nodes[p_treenode_edge].current.left].version == p_version) {
 			winding += tree_nodes[tree_nodes[p_treenode_edge].current.left].previous.sum_value;
 		} else {
 			winding += tree_nodes[tree_nodes[p_treenode_edge].current.left].current.sum_value;
 		}
 	}
 	while (parent) {
-		if (tree_nodes[parent].version == p_x) {
+		if (tree_nodes[parent].version == p_version) {
 			if (tree_nodes[parent].previous.right == current) {
-				if (tree_nodes[tree_nodes[parent].previous.left].version == p_x) {
+				if (tree_nodes[tree_nodes[parent].previous.left].version == p_version) {
 					winding += tree_nodes[tree_nodes[parent].previous.left].previous.sum_value + tree_nodes[parent].self_value;
 				} else {
 					winding += tree_nodes[tree_nodes[parent].previous.left].current.sum_value + tree_nodes[parent].self_value;
@@ -1344,7 +2284,7 @@ int BentleyOttmann::edge_get_winding_previous(uint32_t p_treenode_edge, R128 p_x
 			parent = tree_nodes[current].previous.parent;
 		} else {
 			if (tree_nodes[parent].current.right == current) {
-				if (tree_nodes[tree_nodes[parent].current.left].version == p_x) {
+				if (tree_nodes[tree_nodes[parent].current.left].version == p_version) {
 					winding += tree_nodes[tree_nodes[parent].current.left].previous.sum_value + tree_nodes[parent].self_value;
 				} else {
 					winding += tree_nodes[tree_nodes[parent].current.left].current.sum_value + tree_nodes[parent].self_value;
@@ -1357,67 +2297,50 @@ int BentleyOttmann::edge_get_winding_previous(uint32_t p_treenode_edge, R128 p_x
 	return winding;
 }
 
-void BentleyOttmann::check_intersection(uint32_t p_treenode_edge, R128 p_x_min) {
+void BentleyOttmann::check_intersection(uint32_t p_treenode_edge) {
 	DEV_ASSERT(p_treenode_edge != edges_tree && tree_nodes[p_treenode_edge].current.next != edges_tree);
 	Edge &edge1 = edges[tree_nodes[p_treenode_edge].element];
 	Edge &edge2 = edges[tree_nodes[tree_nodes[p_treenode_edge].current.next].element];
-	R128 start1_x = points[edge1.point_start].x;
-	R128 start1_y = points[edge1.point_start].y;
-	R128 dir1_x = edge1.dir_x;
-	R128 dir1_y = edge1.dir_y;
-	R128 start2_x = points[edge2.point_start].x;
-	R128 start2_y = points[edge2.point_start].y;
-	R128 dir2_x = edge2.dir_x;
-	R128 dir2_y = edge2.dir_y;
-	R128 max = (edge1.x_next_check < edge2.x_next_check) ? edge1.x_next_check : edge2.x_next_check;
-	if (max <= p_x_min) {
+	int32_t max[5];
+	int32_t check[5];
+	bigint28_copy<5, 5>(check, slices[edge1.next_check].x);
+	bigint28_sub<5, 5>(check, slices[edge2.next_check].x);
+	if (bigint28_sign<5>(check) < 0) {
+		bigint28_copy<5, 5>(max, slices[edge1.next_check].x);
+	} else {
+		bigint28_copy<5, 5>(max, slices[edge2.next_check].x);
+	}
+	int32_t max_factor1[10];
+	int32_t max_total1[15];
+	int32_t max_factor2[10];
+	int32_t max_total2[15];
+	bigint28_mul<5, 5>(max_factor1, max, edge1.dir_y);
+	bigint28_add<10, 10>(max_factor1, edge1.cross);
+	bigint28_mul<10, 5>(max_total1, max_factor1, edge2.dir_x);
+	bigint28_mul<5, 5>(max_factor2, max, edge2.dir_y);
+	bigint28_add<10, 10>(max_factor2, edge2.cross);
+	bigint28_mul<10, 5>(max_total2, max_factor2, edge1.dir_x);
+	bigint28_sub<15, 15>(max_total2, max_total1);
+	if (max_total2[14] >= 0) {
 		return;
 	}
-	R128 y1min, m1min, y2min, m2min;
-	R128 y1mid, m1mid, y2mid, m2mid;
-	R128 y1max, m1max, y2max, m2max;
-	quotient(max - start1_x, dir1_y, dir1_x, y1max, m1max);
-	quotient(max - start2_x, dir2_y, dir2_x, y2max, m2max);
-	y1max += start1_y;
-	y2max += start2_y;
-	if (y1max <= y2max) {
-		return;
-	}
-	quotient(p_x_min - start1_x, dir1_y, dir1_x, y1min, m1min);
-	quotient(p_x_min - start2_x, dir2_y, dir2_x, y2min, m2min);
-	y1min += start1_y;
-	y2min += start2_y;
-	R128 y1step = edge1.step_y;
-	R128 m1step = edge1.step_mod;
-	R128 y2step = edge2.step_y;
-	R128 m2step = edge2.step_mod;
-	DEV_ASSERT(y1min <= y2min);
-	while (p_x_min + R128_smallest < max) {
-		R128 mid = (p_x_min + max) >> 1;
-		if ((p_x_min + max) & R128_smallest) {
-			quotient_mid(y1min, m1min, y1max, m1max, y1step, m1step, dir1_x, y1mid, m1mid);
-			quotient_mid(y2min, m2min, y2max, m2max, y2step, m2step, dir2_x, y2mid, m2mid);
-		} else {
-			quotient_mid(y1min, m1min, y1max, m1max, R128_zero, R128_zero, dir1_x, y1mid, m1mid);
-			quotient_mid(y2min, m2min, y2max, m2max, R128_zero, R128_zero, dir2_x, y2mid, m2mid);
-		}
-		if (y1mid > y2mid) {
-			max = mid;
-			y1max = y1mid;
-			m1max = m1mid;
-			y2max = y2mid;
-			m2max = m2mid;
-		} else {
-			p_x_min = mid;
-			y1min = y1mid;
-			m1min = m1mid;
-			y2min = y2mid;
-			m2min = m2mid;
-		}
-	}
-	DEV_ASSERT(p_x_min + R128_smallest == max);
-	edge1.x_next_check = p_x_min;
-	list_insert(edge1.listnode_check, slices[add_slice(p_x_min)].check_list);
+	int32_t total1[15];
+	int32_t total2[15];
+	int32_t factor1[10];
+	int32_t factor2[10];
+	int32_t x_next_check[15];
+	int32_t mod[10];
+	bigint28_mul<10, 5>(total1, edge1.cross, edge2.dir_x);
+	bigint28_mul<10, 5>(total2, edge2.cross, edge1.dir_x);
+	bigint28_sub<15, 15>(total2, total1);
+	bigint28_mul<5, 5>(factor1, edge1.dir_y, edge2.dir_x);
+	bigint28_mul<5, 5>(factor2, edge2.dir_y, edge1.dir_x);
+	bigint28_sub<10, 10>(factor1, factor2);
+	bigint28_div<15, 10>(x_next_check, mod, total2, factor1);
+	int32_t x_slice[5];
+	bigint28_copy<5, 15>(x_slice, x_next_check);
+	edge1.next_check = add_slice(x_slice);
+	list_insert(edge1.listnode_check, slices[edge1.next_check].check_list);
 }
 
 uint32_t BentleyOttmann::tree_create(uint32_t p_element, int p_value) {
@@ -1429,7 +2352,7 @@ uint32_t BentleyOttmann::tree_create(uint32_t p_element, int p_value) {
 	return node.current.next;
 }
 
-void BentleyOttmann::tree_insert(uint32_t p_insert_item, uint32_t p_insert_after, const R128 &p_version) {
+void BentleyOttmann::tree_insert(uint32_t p_insert_item, uint32_t p_insert_after, uint32_t p_version) {
 	DEV_ASSERT(p_insert_item != 0 && p_insert_after != 0);
 	tree_version(p_insert_item, p_version);
 	tree_version(p_insert_after, p_version);
@@ -1526,7 +2449,7 @@ void BentleyOttmann::tree_insert(uint32_t p_insert_item, uint32_t p_insert_after
 	}
 }
 
-void BentleyOttmann::tree_remove(uint32_t p_remove_item, const R128 &p_version) {
+void BentleyOttmann::tree_remove(uint32_t p_remove_item, uint32_t p_version) {
 	DEV_ASSERT(tree_nodes[p_remove_item].current.parent != 0);
 	if (tree_nodes[p_remove_item].current.left != 0 && tree_nodes[p_remove_item].current.right != 0) {
 		uint32_t prev = tree_nodes[p_remove_item].current.prev;
@@ -1648,7 +2571,7 @@ void BentleyOttmann::tree_remove(uint32_t p_remove_item, const R128 &p_version) 
 	}
 }
 
-void BentleyOttmann::tree_rotate(uint32_t p_item, const R128 &p_version) {
+void BentleyOttmann::tree_rotate(uint32_t p_item, uint32_t p_version) {
 	DEV_ASSERT(tree_nodes[tree_nodes[p_item].current.parent].current.parent != 0);
 	uint32_t parent = tree_nodes[p_item].current.parent;
 	tree_version(p_item, p_version);
@@ -1685,7 +2608,7 @@ void BentleyOttmann::tree_rotate(uint32_t p_item, const R128 &p_version) {
 	tree_nodes[p_item].current.size = tree_nodes[tree_nodes[p_item].current.left].current.size + tree_nodes[tree_nodes[p_item].current.right].current.size + 1;
 }
 
-void BentleyOttmann::tree_swap(uint32_t p_item1, uint32_t p_item2, const R128 &p_version) {
+void BentleyOttmann::tree_swap(uint32_t p_item1, uint32_t p_item2, uint32_t p_version) {
 	DEV_ASSERT(tree_nodes[p_item1].current.parent != 0 && tree_nodes[p_item2].current.parent != 0);
 	tree_version(p_item1, p_version);
 	tree_version(p_item2, p_version);
@@ -1779,7 +2702,7 @@ void BentleyOttmann::tree_swap(uint32_t p_item1, uint32_t p_item2, const R128 &p
 	}
 }
 
-void BentleyOttmann::tree_version(uint32_t p_item, const R128 &p_version) {
+void BentleyOttmann::tree_version(uint32_t p_item, uint32_t p_version) {
 	DEV_ASSERT(p_item != 0);
 	if (tree_nodes[p_item].version == p_version) {
 		return;
@@ -1802,7 +2725,7 @@ void BentleyOttmann::tree_index(uint32_t p_item) {
 	tree_nodes[p_item].index = index;
 }
 
-void BentleyOttmann::tree_index_previous(uint32_t p_item, const R128 &p_version) {
+void BentleyOttmann::tree_index_previous(uint32_t p_item, uint32_t p_version) {
 	int index;
 	uint32_t current = p_item;
 	uint32_t parent;

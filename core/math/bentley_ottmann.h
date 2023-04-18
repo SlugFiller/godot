@@ -33,7 +33,6 @@
 
 #include "core/math/vector2.h"
 #include "core/templates/local_vector.h"
-#include "thirdparty/misc/r128.h"
 
 class BentleyOttmann {
 public:
@@ -58,7 +57,7 @@ private:
 		int self_value = 0;
 		uint32_t index = 0;
 		uint32_t element = 0;
-		R128 version = R128_zero;
+		uint32_t version = 0;
 	};
 	LocalVector<TreeNode> tree_nodes;
 
@@ -71,7 +70,7 @@ private:
 	LocalVector<ListNode> list_nodes;
 
 	struct Slice {
-		R128 x;
+		int32_t x[5];
 		uint32_t points_tree;
 		uint32_t vertical_tree;
 		uint32_t check_list;
@@ -81,8 +80,8 @@ private:
 
 	struct Point {
 		uint32_t slice;
-		R128 x;
-		R128 y;
+		int32_t x[5];
+		int32_t y[5];
 		uint32_t incoming_tree;
 		uint32_t outgoing_tree;
 		uint32_t used;
@@ -99,46 +98,44 @@ private:
 		uint32_t listnode_incoming;
 		uint32_t listnode_outgoing;
 		uint32_t listnode_check;
-		R128 x_next_check;
-		R128 x_last_calculate;
-		R128 y;
-		R128 y_next;
-		R128 dir_x;
-		R128 dir_y;
-		R128 step_y;
-		R128 step_mod;
+		uint32_t next_check;
+		int32_t dir_x[5];
+		int32_t dir_y[5];
+		int32_t cross[10];
 	};
 	LocalVector<Edge> edges;
 	uint32_t edges_tree;
 
 	struct Vertical {
-		R128 y;
+		int32_t y[5];
 		bool is_start;
 	};
 	LocalVector<Vertical> verticals;
 
-	uint32_t add_slice(R128 p_x);
-	uint32_t add_point(uint32_t p_slice, R128 p_y);
-	uint32_t get_point_or_before(uint32_t p_slice, R128 p_y);
+	uint32_t add_slice(const int32_t p_x[5]);
+	uint32_t add_point(uint32_t p_slice, const int32_t p_y[5]);
+	uint32_t get_point_before_edge(uint32_t p_slice, uint32_t p_edge, bool p_next_x);
+	bool is_point_on_edge(uint32_t p_point, uint32_t p_edge, bool p_next_x);
 	uint32_t point_get_incoming_before(uint32_t p_point, uint32_t p_index);
 	uint32_t point_get_outgoing_before(uint32_t p_point, uint32_t p_index);
 	void add_edge(uint32_t p_point_start, uint32_t p_point_end, int p_winding);
-	void add_vertical_edge(uint32_t p_slice, R128 p_y_start, R128 p_y_end);
-	void edge_calculate_y(uint32_t p_edge, R128 p_x);
-	uint32_t get_edge_before(R128 p_x, R128 p_y);
-	uint32_t get_edge_before_end(R128 p_x, R128 p_y, R128 p_end_x, R128 p_end_y);
-	uint32_t get_edge_before_previous(R128 p_x, R128 p_y);
-	int edge_get_winding_previous(uint32_t p_treenode_edge, R128 p_x);
-	void check_intersection(uint32_t p_treenode_edge, R128 p_x_min);
+	void add_vertical_edge(uint32_t p_slice, const int32_t p_y_start[5], const int32_t p_y_end[5]);
+	void edge_intersect_x(int32_t r_y[5], uint32_t p_edge, const int32_t p_x[5]);
+	void edge_intersect_edge(int32_t r_y[5], uint32_t p_edge1, uint32_t p_edge2);
+	uint32_t get_edge_before(const int32_t p_x[5], const int32_t p_y[5]);
+	uint32_t get_edge_before_end(const int32_t p_x[5], const int32_t p_y[5], const int32_t p_end_x[5], const int32_t p_end_y[5]);
+	uint32_t get_edge_before_previous(uint32_t p_slice, const int32_t p_y[5]);
+	int edge_get_winding_previous(uint32_t p_treenode_edge, uint32_t p_version);
+	void check_intersection(uint32_t p_treenode_edge);
 
 	uint32_t tree_create(uint32_t p_element = 0, int p_value = 0);
-	void tree_insert(uint32_t p_insert_item, uint32_t p_insert_after, const R128 &p_version = R128_zero);
-	void tree_remove(uint32_t p_remove_item, const R128 &p_version = R128_zero);
-	void tree_rotate(uint32_t p_item, const R128 &p_version = R128_zero);
-	void tree_swap(uint32_t p_item1, uint32_t p_item2, const R128 &p_version = R128_zero);
-	void tree_version(uint32_t p_item, const R128 &p_version);
+	void tree_insert(uint32_t p_insert_item, uint32_t p_insert_after, uint32_t p_version = 0);
+	void tree_remove(uint32_t p_remove_item, uint32_t p_version = 0);
+	void tree_rotate(uint32_t p_item, uint32_t p_version = 0);
+	void tree_swap(uint32_t p_item1, uint32_t p_item2, uint32_t p_version = 0);
+	void tree_version(uint32_t p_item, uint32_t p_version);
 	void tree_index(uint32_t p_item);
-	void tree_index_previous(uint32_t p_item, const R128 &p_version = R128_zero);
+	void tree_index_previous(uint32_t p_item, uint32_t p_version = 0);
 
 	uint32_t list_create(uint32_t p_element = 0);
 	void list_insert(uint32_t p_insert_item, uint32_t p_list);
