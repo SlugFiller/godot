@@ -41,23 +41,16 @@ public:
 	Vector<int32_t> out_triangles;
 
 private:
+	int winding_mask;
+
 	struct TreeNode {
-		struct Version {
-			uint32_t parent = 0;
-			uint32_t left = 0;
-			uint32_t right = 0;
-			uint32_t prev = 0;
-			uint32_t next = 0;
-			bool is_heavy = false;
-			int sum_value = 0;
-			uint32_t size = 0;
-			uint32_t index = 0;
-		};
-		Version current;
-		Version previous;
-		int self_value = 0;
+		uint32_t parent = 0;
+		uint32_t left = 0;
+		uint32_t right = 0;
+		uint32_t prev = 0;
+		uint32_t next = 0;
+		bool is_heavy = false;
 		uint32_t element = 0;
-		uint32_t version = 0;
 	};
 	thread_local static LocalVector<TreeNode> tree_nodes;
 
@@ -71,39 +64,38 @@ private:
 
 	struct Slice {
 		int64_t x;
-		uint32_t points_tree;
 		uint32_t vertical_tree;
-		uint32_t check_list;
 	};
 	thread_local static LocalVector<Slice> slices;
 	uint32_t slices_tree;
 
 	struct Point {
-		uint32_t slice;
 		int64_t x;
 		int64_t y;
-		uint32_t incoming_tree;
+		int64_t factor;
 		uint32_t outgoing_tree;
+		uint32_t listnode_edge_prev;
+		uint32_t listnode_edge_next;
 		uint32_t used;
 	};
 	thread_local static LocalVector<Point> points;
+	uint32_t points_tree;
 
 	struct Edge {
 		uint32_t point_start;
 		uint32_t point_end;
 		uint32_t point_outgoing;
 		uint32_t treenode_edges;
-		uint32_t treenode_incoming;
 		uint32_t treenode_outgoing;
-		uint32_t listnode_incoming;
-		uint32_t listnode_outgoing;
-		uint32_t listnode_check;
-		uint32_t next_check;
+		uint32_t points_prev_list;
+		uint32_t points_next_list;
 		int64_t dir_x;
 		int64_t dir_y;
 		int64_t cross;
 		int64_t min_y;
 		int64_t max_y;
+		int winding;
+		int winding_total;
 	};
 	thread_local static LocalVector<Edge> edges;
 	uint32_t edges_tree;
@@ -114,37 +106,33 @@ private:
 	};
 	thread_local static LocalVector<Vertical> verticals;
 
+	thread_local static LocalVector<uint32_t> triangles;
+
 	uint32_t add_slice(int64_t p_x);
-	uint32_t add_point(uint32_t p_slice, int64_t p_y);
-	uint32_t get_point_before_edge(uint32_t p_slice, uint32_t p_edge, bool p_next_x);
-	bool is_point_on_edge(uint32_t p_point, uint32_t p_edge, bool p_next_x);
-	uint32_t point_get_incoming_before(uint32_t p_point, uint32_t p_index);
-	uint32_t point_get_outgoing_before(uint32_t p_point, uint32_t p_index);
+	uint32_t add_point(int64_t p_x, int64_t p_y, int64_t p_factor);
+	void point_add_outgoing(uint32_t p_point, uint32_t p_edge);
 	void add_edge(uint32_t p_point_start, uint32_t p_point_end, int p_winding);
-	void add_vertical_edge(uint32_t p_slice, const int64_t p_y_start, const int64_t p_y_end);
-	int64_t edge_intersect_x(uint32_t p_edge, const int64_t p_x);
-	int64_t edge_intersect_edge(uint32_t p_edge1, uint32_t p_edge2);
-	uint32_t get_edge_before(const int64_t p_x, const int64_t p_y);
-	uint32_t get_edge_before_end(const int64_t p_x, const int64_t p_y, const int64_t p_end_x, const int64_t p_end_y);
-	uint32_t get_edge_before_previous(uint32_t p_slice, const int64_t p_y);
-	int edge_get_winding_previous(uint32_t p_treenode_edge, uint32_t p_version);
+	void add_vertical_edge(uint32_t p_slice, int64_t p_y_start, int64_t p_y_end);
+	void edge_intersect_x(uint32_t p_edge, int64_t p_x);
+	void edge_intersect_edge(uint32_t p_edge1, uint32_t p_edge2);
+	void edge_set_outgoing(uint32_t p_edge, uint32_t p_point);
+	void edge_add_point_before(uint32_t p_edge, uint32_t p_point);
+	void edge_add_point_after(uint32_t p_edge, uint32_t p_point);
+	uint32_t get_edge_before(int64_t p_x, int64_t p_y);
+	uint32_t get_edge_before_point(uint32_t p_point);
 	void check_intersection(uint32_t p_treenode_edge);
 
-	uint32_t tree_create(uint32_t p_element = 0, int p_value = 0);
-	template <bool simple>
-	void tree_clear(uint32_t p_tree, uint32_t p_version = 0);
-	template <bool simple>
-	void tree_insert(uint32_t p_insert_item, uint32_t p_insert_after, uint32_t p_version = 0);
-	template <bool simple>
-	void tree_remove(uint32_t p_remove_item, uint32_t p_version = 0);
-	template <bool simple>
-	void tree_rotate(uint32_t p_item, uint32_t p_version = 0);
-	template <bool simple>
-	void tree_swap(uint32_t p_item1, uint32_t p_item2, uint32_t p_version = 0);
-	template <bool simple>
-	void tree_version(uint32_t p_item, uint32_t p_version);
-	void tree_index(uint32_t p_item);
-	void tree_index_previous(uint32_t p_item, uint32_t p_version = 0);
+	int cmp_point_point(int64_t p_x, int64_t p_y, int64_t factor, uint32_t p_point);
+	int cmp_point_edge(uint32_t p_point, uint32_t p_edge);
+	int cmp_cross(uint32_t p_point1, uint32_t p_point2, uint32_t p_point_rel);
+
+	uint32_t tree_create(uint32_t p_element = 0);
+	void tree_clear(uint32_t p_tree);
+	void tree_insert(uint32_t p_insert_item, uint32_t p_insert_after);
+	void tree_remove(uint32_t p_remove_item);
+	void tree_rotate(uint32_t p_item);
+	void tree_swap(uint32_t p_item1, uint32_t p_item2);
+	void tree_replace(uint32_t p_item1, uint32_t p_item2);
 
 	uint32_t list_create(uint32_t p_element = 0);
 	void list_insert(uint32_t p_insert_item, uint32_t p_list);

@@ -39,6 +39,7 @@ thread_local LocalVector<BentleyOttmann::Slice> BentleyOttmann::slices;
 thread_local LocalVector<BentleyOttmann::Point> BentleyOttmann::points;
 thread_local LocalVector<BentleyOttmann::Edge> BentleyOttmann::edges;
 thread_local LocalVector<BentleyOttmann::Vertical> BentleyOttmann::verticals;
+thread_local LocalVector<uint32_t> BentleyOttmann::triangles;
 
 BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, bool p_winding_even_odd) {
 	tree_nodes.clear();
@@ -47,13 +48,15 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 	points.clear();
 	edges.clear();
 	verticals.clear();
+	triangles.clear();
 	// The cost of an explicit nil node is lower than having a special nil value.
 	// This also ensures that tree_nodes[0].element is 0 instead of a null pointer exception.
 	TreeNode nil_node;
 	tree_nodes.push_back(nil_node);
 	edges_tree = tree_create();
 	slices_tree = tree_create();
-	int winding_mask = p_winding_even_odd ? 1 : -1;
+	points_tree = tree_create();
+	winding_mask = p_winding_even_odd ? 1 : -1;
 
 	ERR_FAIL_COND(p_edges.size() & 1);
 	ERR_FAIL_COND((p_edges.size() >> 1) != p_winding.size());
@@ -81,27 +84,22 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 	if (x_exp == EXP_MIN) {
 		x_exp = 0;
 	} else {
-		x_exp -= 21;
+		x_exp -= 20;
 	}
 	if (y_exp == EXP_MIN) {
 		y_exp = 0;
 	} else {
-		y_exp -= 21;
+		y_exp -= 20;
 	}
 	for (int i = 0, j = 0; i < p_winding.size(); i++, j += 2) {
-		if (!p_winding[i]) {
-			// Zero-winding edges are used internally for concave shapes and holes.
-			// Therefore, don't allow them as input.
-			continue;
-		}
 		int64_t start_x = static_cast<int64_t>(ldexp(p_edges[j].x, -x_exp));
 		int64_t start_y = static_cast<int64_t>(ldexp(p_edges[j].y, -y_exp));
 		int64_t end_x = static_cast<int64_t>(ldexp(p_edges[j + 1].x, -x_exp));
 		int64_t end_y = static_cast<int64_t>(ldexp(p_edges[j + 1].y, -y_exp));
 		if (start_x < end_x) {
-			add_edge(add_point(add_slice(start_x), start_y), add_point(add_slice(end_x), end_y), p_winding[i]);
+			add_edge(add_point(start_x, start_y, 1), add_point(end_x, end_y, 1), p_winding[i]);
 		} else if (start_x > end_x) {
-			add_edge(add_point(add_slice(end_x), end_y), add_point(add_slice(start_x), start_y), -p_winding[i]);
+			add_edge(add_point(end_x, end_y, 1), add_point(start_x, start_y, 1), -p_winding[i]);
 		} else if (start_y < end_y) {
 			add_vertical_edge(add_slice(start_x), start_y, end_y);
 		} else if (start_y > end_y) {
@@ -109,438 +107,101 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 		}
 	}
 
-	LocalVector<uint32_t> triangles;
-	uint32_t incoming_list = list_create();
-	uint32_t outgoing_list = list_create();
-
-	uint32_t slice_iter = tree_nodes[slices_tree].current.next;
-	while (slice_iter != slices_tree) {
-		uint32_t slice = tree_nodes[slice_iter].element;
-
-		{
-			// Remove edges ending at this slice
-			uint32_t check_iter = list_nodes[slices[slice].check_list].next;
-			while (check_iter != slices[slice].check_list) {
-				DEV_ASSERT(edges[list_nodes[check_iter].element].next_check == slice);
-				uint32_t check_iter_next = list_nodes[check_iter].next;
-				if (points[edges[list_nodes[check_iter].element].point_end].slice == slice) {
-					uint32_t treenode_edge_prev = tree_nodes[edges[list_nodes[check_iter].element].treenode_edges].current.prev;
-					if (treenode_edge_prev != edges_tree) {
-						edges[tree_nodes[treenode_edge_prev].element].next_check = slice;
-						list_insert(edges[tree_nodes[treenode_edge_prev].element].listnode_check, slices[slice].check_list);
-					}
-					list_insert(edges[list_nodes[check_iter].element].listnode_incoming, incoming_list);
-					tree_remove<false>(edges[list_nodes[check_iter].element].treenode_edges, slice);
-					list_remove(check_iter);
-				}
-				check_iter = check_iter_next;
+	uint32_t slice_iter = tree_nodes[slices_tree].next;
+	uint32_t point_iter = points_tree;
+	while (true) {
+		uint32_t point_iter_next = tree_nodes[point_iter].next;
+		if (unlikely(point_iter_next == points_tree || (slice_iter != slices_tree && points[tree_nodes[point_iter_next].element].x >= slices[tree_nodes[slice_iter].element].x * points[tree_nodes[point_iter_next].element].factor))) {
+			// There's at least two points per slice, so slices are less likely than points
+			if (unlikely(slice_iter == slices_tree)) {
+				// And the end of the shape only happens once in the loop
+				break;
 			}
-		}
+			uint32_t slice = tree_nodes[slice_iter].element;
+			slice_iter = tree_nodes[slice_iter].next;
+			int64_t slice_x = slices[slice].x;
 
-		{
 			// Mark intersection of passthrough edges with vertical edges
-			uint32_t vertical_iter = tree_nodes[slices[slice].vertical_tree].current.next;
+			uint32_t vertical_iter = tree_nodes[slices[slice].vertical_tree].next;
 			while (vertical_iter != slices[slice].vertical_tree) {
 				DEV_ASSERT(verticals[tree_nodes[vertical_iter].element].is_start);
-				uint32_t treenode_edge = get_edge_before(slices[slice].x, verticals[tree_nodes[vertical_iter].element].y);
-				vertical_iter = tree_nodes[vertical_iter].current.next;
+				uint32_t treenode_edge = get_edge_before(slice_x, verticals[tree_nodes[vertical_iter].element].y);
+				vertical_iter = tree_nodes[vertical_iter].next;
 				DEV_ASSERT(vertical_iter != slices[slice].vertical_tree);
 				DEV_ASSERT(!verticals[tree_nodes[vertical_iter].element].is_start);
-				while (tree_nodes[treenode_edge].current.next != edges_tree) {
-					treenode_edge = tree_nodes[treenode_edge].current.next;
+				int64_t y_end = verticals[tree_nodes[vertical_iter].element].y;
+				while (tree_nodes[treenode_edge].next != edges_tree) {
+					treenode_edge = tree_nodes[treenode_edge].next;
 					const Edge &edge = edges[tree_nodes[treenode_edge].element];
-					if (verticals[tree_nodes[vertical_iter].element].y * edge.dir_x + slices[slice].x * edge.dir_y <= edge.cross) {
+					if (y_end * edge.dir_x - slice_x * edge.dir_y <= edge.cross) {
 						break;
 					}
-					int64_t y = edge_intersect_x(tree_nodes[treenode_edge].element, slices[slice].x);
-					add_point(slice, y);
-					list_insert(edges[tree_nodes[treenode_edge].element].listnode_incoming, incoming_list);
-					list_insert(edges[tree_nodes[treenode_edge].element].listnode_outgoing, outgoing_list);
-					DEV_ASSERT(is_point_on_edge(add_point(slice, y), tree_nodes[treenode_edge].element, false));
+					edge_intersect_x(tree_nodes[treenode_edge].element, slice_x);
 				}
-				vertical_iter = tree_nodes[vertical_iter].current.next;
+				vertical_iter = tree_nodes[vertical_iter].next;
 			}
-		}
+		} else {
+			uint32_t point = tree_nodes[point_iter = point_iter_next].element;
+			uint32_t treenode_edge_before = get_edge_before_point(point);
 
-		{
-			// Add edges starting at this slice
-			uint32_t check_iter = list_nodes[slices[slice].check_list].next;
-			while (check_iter != slices[slice].check_list) {
-				DEV_ASSERT(edges[list_nodes[check_iter].element].next_check == slice);
-				if (points[edges[list_nodes[check_iter].element].point_start].slice == slice) {
-					uint32_t treenode_edge = get_edge_before_end(slices[slice].x, points[edges[list_nodes[check_iter].element].point_start].y, points[edges[list_nodes[check_iter].element].point_end].x, points[edges[list_nodes[check_iter].element].point_end].y);
-					list_insert(edges[list_nodes[check_iter].element].listnode_outgoing, outgoing_list);
-					tree_insert<false>(edges[list_nodes[check_iter].element].treenode_edges, treenode_edge, slice);
-					if (treenode_edge != edges_tree) {
-						edges[tree_nodes[treenode_edge].element].next_check = slice;
-						list_insert(edges[tree_nodes[treenode_edge].element].listnode_check, slices[slice].check_list);
-					}
-				}
-				check_iter = list_nodes[check_iter].next;
-			}
-		}
-
-		{
-			// Check order changes of edges, and mark as intersections
-			int64_t x = slices[slice].x + 1;
-			while (list_nodes[slices[slice].check_list].next != slices[slice].check_list) {
-				uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-				DEV_ASSERT(edges[edge].next_check == slice);
-				// Reset the next check of the checked edge to its end point.
-				// This will be reduced to the nearest intersection if one is found.
-				edges[edge].next_check = points[edges[edge].point_end].slice;
-				list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
-				uint32_t treenode_edge_next = tree_nodes[edges[edge].treenode_edges].current.next;
-				if (treenode_edge_next == edges_tree) {
-					continue;
-				}
-				uint32_t edge_next = tree_nodes[treenode_edge_next].element;
-				Edge &edge1 = edges[edge];
-				Edge &edge2 = edges[edge_next];
-				if (edge1.max_y < edge2.min_y) {
-					continue;
-				}
-				if ((x * edge2.dir_y + edge2.cross) * edge1.dir_x >= (x * edge1.dir_y + edge1.cross) * edge2.dir_x) {
-					continue;
-				}
-				add_point(slice, edge_intersect_edge(edge, edge_next));
-				if (tree_nodes[edges[edge].treenode_edges].self_value == 0) {
-					tree_remove<false>(edges[edge].treenode_edges, slice);
-					if (points[edges[edge].point_start].slice != slice) {
-						list_insert(edges[edge].listnode_incoming, incoming_list);
-					}
-					if (points[edges[edge_next].point_start].slice != slice) {
-						list_insert(edges[edge_next].listnode_incoming, incoming_list);
-					}
-					list_insert(edges[edge_next].listnode_outgoing, outgoing_list);
-					list_remove(edges[edge].listnode_check);
-					uint32_t treenode_edge_prev = tree_nodes[treenode_edge_next].current.prev;
-					if (treenode_edge_prev != edges_tree) {
-						edges[tree_nodes[treenode_edge_prev].element].next_check = slice;
-						list_insert(edges[tree_nodes[treenode_edge_prev].element].listnode_check, slices[slice].check_list);
-					}
-				} else if (tree_nodes[treenode_edge_next].self_value == 0) {
-					tree_remove<false>(treenode_edge_next, slice);
-					if (points[edges[edge].point_start].slice != slice) {
-						list_insert(edges[edge].listnode_incoming, incoming_list);
-					}
-					if (points[edges[edge_next].point_start].slice != slice) {
-						list_insert(edges[edge_next].listnode_incoming, incoming_list);
-					}
-					list_insert(edges[edge].listnode_outgoing, outgoing_list);
-					list_remove(edges[edge_next].listnode_check);
-					edges[edge].next_check = slice;
-					list_insert(edges[edge].listnode_check, slices[slice].check_list);
+			// Find and remove edges going through this point
+			while (tree_nodes[treenode_edge_before].next != edges_tree) {
+				uint32_t edge = tree_nodes[tree_nodes[treenode_edge_before].next].element;
+				if (edges[edge].point_end == point) {
+					edge_set_outgoing(edge, point);
 				} else {
-					tree_swap<false>(edges[edge].treenode_edges, treenode_edge_next, slice);
-					if (points[edges[edge].point_start].slice != slice) {
-						list_insert(edges[edge].listnode_incoming, incoming_list);
+					if (cmp_point_edge(point, edge) < 0) {
+						break;
 					}
-					if (points[edges[edge_next].point_start].slice != slice) {
-						list_insert(edges[edge_next].listnode_incoming, incoming_list);
-					}
-					list_insert(edges[edge].listnode_outgoing, outgoing_list);
-					list_insert(edges[edge_next].listnode_outgoing, outgoing_list);
-					edges[edge].next_check = slice;
-					list_insert(edges[edge].listnode_check, slices[slice].check_list);
-					uint32_t treenode_edge_prev = tree_nodes[treenode_edge_next].current.prev;
-					if (treenode_edge_prev != edges_tree) {
-						edges[tree_nodes[treenode_edge_prev].element].next_check = slice;
-						list_insert(edges[tree_nodes[treenode_edge_prev].element].listnode_check, slices[slice].check_list);
-					}
+					edge_set_outgoing(edge, point);
+					// An edge merely passing through this point will be re-added below
+					point_add_outgoing(point, edge);
 				}
+				tree_remove(tree_nodes[treenode_edge_before].next);
 			}
-		}
 
-		{
-			// Add incoming edges to points
-			while (list_nodes[incoming_list].next != incoming_list) {
-				uint32_t edge = list_nodes[list_nodes[incoming_list].next].element;
-				list_remove(list_nodes[incoming_list].next);
-				tree_index_previous(edges[edge].treenode_edges, slice);
-				uint32_t treenode_point = get_point_before_edge(slice, edge, false);
-				if (treenode_point == slices[slice].points_tree || (tree_nodes[treenode_point].current.next != slices[slice].points_tree && !is_point_on_edge(tree_nodes[treenode_point].element, edge, false) && (edges[edge].dir_y > 0 || is_point_on_edge(tree_nodes[tree_nodes[treenode_point].current.next].element, edge, false)))) {
-					treenode_point = tree_nodes[treenode_point].current.next;
-				}
-				DEV_ASSERT(treenode_point != slices[slice].points_tree);
-				tree_insert<true>(edges[edge].treenode_incoming, point_get_incoming_before(tree_nodes[treenode_point].element, tree_nodes[edges[edge].treenode_edges].previous.index));
+			// Add point to surrounding edges
+			if (treenode_edge_before != edges_tree) {
+				edge_add_point_after(tree_nodes[treenode_edge_before].element, point);
 			}
-		}
-
-		{
-			// Add outgoing edges to points
-			while (list_nodes[outgoing_list].next != outgoing_list) {
-				uint32_t edge = list_nodes[list_nodes[outgoing_list].next].element;
-				list_remove(list_nodes[outgoing_list].next);
-				tree_index(edges[edge].treenode_edges);
-				uint32_t treenode_point = get_point_before_edge(slice, edge, true);
-				if (treenode_point == slices[slice].points_tree || (tree_nodes[treenode_point].current.next != slices[slice].points_tree && !is_point_on_edge(tree_nodes[treenode_point].element, edge, true) && (edges[edge].dir_y < 0 || is_point_on_edge(tree_nodes[tree_nodes[treenode_point].current.next].element, edge, true)))) {
-					treenode_point = tree_nodes[treenode_point].current.next;
-				}
-				DEV_ASSERT(treenode_point != slices[slice].points_tree);
-				tree_insert<true>(edges[edge].treenode_outgoing, point_get_outgoing_before(tree_nodes[treenode_point].element, tree_nodes[edges[edge].treenode_edges].current.index));
+			if (tree_nodes[treenode_edge_before].next != edges_tree) {
+				edge_add_point_before(tree_nodes[tree_nodes[treenode_edge_before].next].element, point);
 			}
-		}
 
-		{
-			// Erase unused points
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				uint32_t point_iter_next = tree_nodes[point_iter].current.next;
-				if (tree_nodes[points[point].incoming_tree].current.next == points[point].incoming_tree && tree_nodes[points[point].outgoing_tree].current.next == points[point].outgoing_tree) {
-					tree_remove<true>(point_iter);
-				}
-				point_iter = point_iter_next;
-			}
-		}
-
-		{
-			// Force edges going through a point to treat it as intersection
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				// Edges are currently sorted by their y at the next x. To get their sorting
-				// by the y at the current x, we need to use the previous tree
-				uint32_t treenode_edge = get_edge_before_previous(slice, points[point].y);
-				// Find first edge coinciding with the point
-				while (treenode_edge != edges_tree && is_point_on_edge(point, tree_nodes[treenode_edge].element, false)) {
-					if (tree_nodes[treenode_edge].version == slice) {
-						treenode_edge = tree_nodes[treenode_edge].previous.prev;
-					} else {
-						treenode_edge = tree_nodes[treenode_edge].current.prev;
-					}
-				}
-				if (tree_nodes[treenode_edge].version == slice) {
-					treenode_edge = tree_nodes[treenode_edge].previous.next;
-				} else {
-					treenode_edge = tree_nodes[treenode_edge].current.next;
-				}
-				while (treenode_edge != edges_tree && is_point_on_edge(point, tree_nodes[treenode_edge].element, false)) {
-					// If the edge hasn't been already added as either incoming or outgoing
-					if (tree_nodes[edges[tree_nodes[treenode_edge].element].treenode_incoming].current.parent == 0 && tree_nodes[edges[tree_nodes[treenode_edge].element].treenode_outgoing].current.parent == 0) {
-						tree_index_previous(treenode_edge, slice);
-						tree_insert<true>(edges[tree_nodes[treenode_edge].element].treenode_incoming, point_get_incoming_before(point, tree_nodes[treenode_edge].previous.index));
-						if (tree_nodes[treenode_edge].current.parent != 0) {
-							// If the edge wasn't removed this slice, add outgoing too
-							tree_index(treenode_edge);
-							tree_insert<true>(edges[tree_nodes[treenode_edge].element].treenode_outgoing, point_get_outgoing_before(point, tree_nodes[treenode_edge].current.index));
-						}
-					}
-					if (tree_nodes[treenode_edge].version == slice) {
-						treenode_edge = tree_nodes[treenode_edge].previous.next;
-					} else {
-						treenode_edge = tree_nodes[treenode_edge].current.next;
-					}
-				}
-				point_iter = tree_nodes[point_iter].current.next;
-			}
-		}
-
-		{
-			// Produce triangles
+			// Add outgoing edges
 			int winding = 0;
-			uint32_t treenode_edge_previous = edges_tree;
-			uint32_t point_previous = 0;
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				uint32_t treenode_edge_before;
-				if (tree_nodes[points[point].incoming_tree].current.next != points[point].incoming_tree) {
-					uint32_t treenode_edge_first = edges[tree_nodes[tree_nodes[points[point].incoming_tree].current.next].element].treenode_edges;
-					if (tree_nodes[treenode_edge_first].version == slice) {
-						treenode_edge_before = tree_nodes[treenode_edge_first].previous.prev;
-					} else {
-						treenode_edge_before = tree_nodes[treenode_edge_first].current.prev;
-					}
-				} else {
-					treenode_edge_before = get_edge_before_previous(slice, points[point].y);
-				}
-				if (treenode_edge_before == treenode_edge_previous) {
-					if (winding & winding_mask) {
-						DEV_ASSERT(treenode_edge_previous != edges_tree);
-						triangles.push_back(point_previous);
-						triangles.push_back(point);
-						if (tree_nodes[treenode_edge_previous].version == slice) {
-							DEV_ASSERT(tree_nodes[treenode_edge_previous].previous.next != edges_tree);
-							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].previous.next].element].point_outgoing);
-						} else {
-							DEV_ASSERT(tree_nodes[treenode_edge_previous].current.next != edges_tree);
-							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].current.next].element].point_outgoing);
-						}
-					}
-				} else {
-					treenode_edge_previous = treenode_edge_before;
-					winding = edge_get_winding_previous(treenode_edge_previous, slice);
-					if (winding & winding_mask) {
-						DEV_ASSERT(treenode_edge_previous != edges_tree);
-						triangles.push_back(edges[tree_nodes[treenode_edge_previous].element].point_outgoing);
-						triangles.push_back(point);
-						if (tree_nodes[treenode_edge_previous].version == slice) {
-							DEV_ASSERT(tree_nodes[treenode_edge_previous].previous.next != edges_tree);
-							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].previous.next].element].point_outgoing);
-						} else {
-							DEV_ASSERT(tree_nodes[treenode_edge_previous].current.next != edges_tree);
-							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].current.next].element].point_outgoing);
-						}
-					}
-				}
-				uint32_t edge_incoming_iter = tree_nodes[points[point].incoming_tree].current.next;
-				while (edge_incoming_iter != points[point].incoming_tree) {
-					DEV_ASSERT(edges[tree_nodes[edge_incoming_iter].element].treenode_edges == (tree_nodes[treenode_edge_previous].version == slice ? tree_nodes[treenode_edge_previous].previous.next : tree_nodes[treenode_edge_previous].current.next));
-					treenode_edge_previous = edges[tree_nodes[edge_incoming_iter].element].treenode_edges;
-					winding += tree_nodes[treenode_edge_previous].self_value;
-					if (winding & winding_mask) {
-						DEV_ASSERT(treenode_edge_previous != edges_tree);
-						triangles.push_back(edges[tree_nodes[treenode_edge_previous].element].point_outgoing);
-						triangles.push_back(point);
-						if (tree_nodes[treenode_edge_previous].version == slice) {
-							DEV_ASSERT(tree_nodes[treenode_edge_previous].previous.next != edges_tree);
-							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].previous.next].element].point_outgoing);
-						} else {
-							DEV_ASSERT(tree_nodes[treenode_edge_previous].current.next != edges_tree);
-							triangles.push_back(edges[tree_nodes[tree_nodes[treenode_edge_previous].current.next].element].point_outgoing);
-						}
-					}
-					edge_incoming_iter = tree_nodes[edge_incoming_iter].current.next;
-				}
-				point_previous = point;
-				point_iter = tree_nodes[point_iter].current.next;
+			if (treenode_edge_before != edges_tree) {
+				winding = edges[tree_nodes[treenode_edge_before].element].winding_total;
 			}
-		}
-
-		{
-			// Set outgoing points for subsequent triangle production
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				uint32_t edge_outgoing_iter = tree_nodes[points[point].outgoing_tree].current.next;
-				while (edge_outgoing_iter != points[point].outgoing_tree) {
-					edges[tree_nodes[edge_outgoing_iter].element].point_outgoing = point;
-					edge_outgoing_iter = tree_nodes[edge_outgoing_iter].current.next;
-				}
-				point_iter = tree_nodes[point_iter].current.next;
+			uint32_t treenode_outgoing_iter = tree_nodes[points[point].outgoing_tree].next;
+			while (treenode_outgoing_iter != points[point].outgoing_tree) {
+				winding += edges[tree_nodes[treenode_outgoing_iter].element].winding;
+				edges[tree_nodes[treenode_outgoing_iter].element].winding_total = winding;
+				treenode_outgoing_iter = tree_nodes[treenode_outgoing_iter].next;
 			}
-		}
-
-		{
-			// Add helper edges
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				// Concave point or hole in the x direction
-				// Has two connected points with equal or lower x. Add an edge
-				// ensuring those points are not connected to each other.
-				if (tree_nodes[points[point].outgoing_tree].current.next == points[point].outgoing_tree) {
-					uint32_t treenode_edge_before = get_edge_before(slices[slice].x, points[point].y);
-					if (treenode_edge_before != edges_tree && tree_nodes[treenode_edge_before].current.next != edges_tree) {
-						DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-						if (points[edges[tree_nodes[treenode_edge_before].element].point_end].x < points[edges[tree_nodes[tree_nodes[treenode_edge_before].current.next].element].point_end].x) {
-							add_edge(point, edges[tree_nodes[treenode_edge_before].element].point_end, 0);
-						} else {
-							add_edge(point, edges[tree_nodes[tree_nodes[treenode_edge_before].current.next].element].point_end, 0);
-						}
-						// Adding the edge at the current slice will cause it to be added to the check list.
-						// Remove it, and add it to the point's outgoing edges.
-						DEV_ASSERT(list_nodes[slices[slice].check_list].next != slices[slice].check_list);
-						uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-						tree_insert<false>(edges[edge].treenode_edges, treenode_edge_before, slice);
-						tree_insert<true>(edges[edge].treenode_outgoing, points[point].outgoing_tree);
-						edges[edge].next_check = points[edges[edge].point_end].slice;
-						list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
-						DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-					}
-				}
-				// Concave points in the y direction
-				// A quad formed by the edges connected to this point and the next edges
-				// above or below is concave. Add an edge to split it into triangles.
-				if (tree_nodes[points[point].outgoing_tree].current.next != points[point].outgoing_tree) {
-					{
-						uint32_t edge_first = tree_nodes[tree_nodes[points[point].outgoing_tree].current.next].element;
-						uint32_t treenode_edge_other = tree_nodes[edges[edge_first].treenode_edges].current.prev;
-						if (treenode_edge_other != edges_tree && edges[edge_first].point_start == point) {
-							uint32_t point_edge_end = edges[edge_first].point_end;
-							uint32_t point_other_outgoing = edges[tree_nodes[treenode_edge_other].element].point_outgoing;
-							if ((points[point].x - points[point_other_outgoing].x) * (points[point_edge_end].y - points[point_other_outgoing].y) > (points[point].y - points[point_other_outgoing].y) * (points[point_edge_end].x - points[point_other_outgoing].x)) {
-								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-								add_edge(point, edges[tree_nodes[treenode_edge_other].element].point_end, 0);
-								DEV_ASSERT(list_nodes[slices[slice].check_list].next != slices[slice].check_list);
-								uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-								tree_insert<false>(edges[edge].treenode_edges, treenode_edge_other, slice);
-								tree_insert<true>(edges[edge].treenode_outgoing, points[point].outgoing_tree);
-								edges[edge].next_check = points[edges[edge].point_end].slice;
-								list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
-								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-							}
-						}
-					}
-					{
-						uint32_t edge_last = tree_nodes[tree_nodes[points[point].outgoing_tree].current.prev].element;
-						uint32_t treenode_edge_other = tree_nodes[edges[edge_last].treenode_edges].current.next;
-						if (treenode_edge_other != edges_tree && edges[edge_last].point_start == point) {
-							uint32_t point_edge_end = edges[edge_last].point_end;
-							uint32_t point_other_outgoing = edges[tree_nodes[treenode_edge_other].element].point_outgoing;
-							if ((points[point].x - points[point_other_outgoing].x) * (points[point_edge_end].y - points[point_other_outgoing].y) < (points[point].y - points[point_other_outgoing].y) * (points[point_edge_end].x - points[point_other_outgoing].x)) {
-								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-								add_edge(point, edges[tree_nodes[treenode_edge_other].element].point_end, 0);
-								DEV_ASSERT(list_nodes[slices[slice].check_list].next != slices[slice].check_list);
-								uint32_t edge = list_nodes[list_nodes[slices[slice].check_list].next].element;
-								tree_insert<false>(edges[edge].treenode_edges, edges[edge_last].treenode_edges, slice);
-								tree_insert<true>(edges[edge].treenode_outgoing, edges[edge_last].treenode_outgoing);
-								edges[edge].next_check = points[edges[edge].point_end].slice;
-								list_insert(edges[edge].listnode_check, slices[points[edges[edge].point_end].slice].check_list);
-								DEV_ASSERT(list_nodes[slices[slice].check_list].next == slices[slice].check_list);
-							}
-						}
-					}
-				}
-				point_iter = tree_nodes[point_iter].current.next;
+			treenode_outgoing_iter = tree_nodes[points[point].outgoing_tree].prev;
+			while (treenode_outgoing_iter != points[point].outgoing_tree) {
+				tree_insert(edges[tree_nodes[treenode_outgoing_iter].element].treenode_edges, treenode_edge_before);
+				treenode_outgoing_iter = tree_nodes[treenode_outgoing_iter].prev;
 			}
-		}
 
-		{
-			// Check for possible next intersections
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				uint32_t edge_outgoing_iter = tree_nodes[points[point].outgoing_tree].current.next;
-				if (edge_outgoing_iter != points[point].outgoing_tree) {
-					uint32_t treenode_edge = tree_nodes[edges[tree_nodes[edge_outgoing_iter].element].treenode_edges].current.prev;
-					if (treenode_edge != edges_tree) {
-						check_intersection(treenode_edge);
-					}
-				}
-				while (edge_outgoing_iter != points[point].outgoing_tree) {
-					uint32_t treenode_edge = edges[tree_nodes[edge_outgoing_iter].element].treenode_edges;
-					if (tree_nodes[treenode_edge].current.next != edges_tree) {
-						check_intersection(treenode_edge);
-					}
-					edge_outgoing_iter = tree_nodes[edge_outgoing_iter].current.next;
-				}
-				point_iter = tree_nodes[point_iter].current.next;
+			// Check intersections
+			if (treenode_edge_before != edges_tree && tree_nodes[treenode_edge_before].next != edges_tree) {
+				check_intersection(treenode_edge_before);
 			}
-		}
+			if (tree_nodes[points[point].outgoing_tree].prev != points[point].outgoing_tree) {
+				uint32_t check = edges[tree_nodes[tree_nodes[points[point].outgoing_tree].prev].element].treenode_edges;
+				if (tree_nodes[check].next != edges_tree) {
+					check_intersection(check);
+				}
+			}
 
-		{
 			// Cleanup
-			uint32_t point_iter = tree_nodes[slices[slice].points_tree].current.next;
-			while (point_iter != slices[slice].points_tree) {
-				uint32_t point = tree_nodes[point_iter].element;
-				// Need to clear the incoming and outgoing, so the same edges
-				// can be added to incoming and outgoing in subsequent slices
-				tree_clear<true>(points[point].incoming_tree);
-				tree_clear<true>(points[point].outgoing_tree);
-				point_iter = tree_nodes[point_iter].current.next;
-			}
+			tree_clear(points[point].outgoing_tree);
 		}
-
-		DEV_ASSERT(list_nodes[incoming_list].next == incoming_list);
-		DEV_ASSERT(list_nodes[outgoing_list].next == outgoing_list);
-
-		slice_iter = tree_nodes[slice_iter].current.next;
 	}
 
-	DEV_ASSERT(tree_nodes[edges_tree].current.right == 0);
+	DEV_ASSERT(tree_nodes[edges_tree].right == 0);
 
 	// Optimize points and flush to final buffers
 	for (uint32_t i = 0; i < points.size(); i++) {
@@ -554,7 +215,7 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 		}
 		for (uint32_t j = 0; j < 3; i++, j++) {
 			if (!points[triangles[i]].used) {
-				out_points.push_back(Vector2(ldexp(static_cast<real_t>(points[triangles[i]].x), x_exp), ldexp(static_cast<real_t>(points[triangles[i]].y), y_exp)));
+				out_points.push_back(Vector2(ldexp(static_cast<real_t>(points[triangles[i]].x / points[triangles[i]].factor), x_exp), ldexp(static_cast<real_t>(points[triangles[i]].y / points[triangles[i]].factor), y_exp)));
 				points[triangles[i]].used = out_points.size();
 			}
 			out_triangles.push_back(points[triangles[i]].used - 1);
@@ -564,21 +225,21 @@ BentleyOttmann::BentleyOttmann(Vector<Vector2> p_edges, Vector<int> p_winding, b
 
 uint32_t BentleyOttmann::add_slice(int64_t p_x) {
 	uint32_t insert_after = slices_tree;
-	uint32_t current = tree_nodes[slices_tree].current.right;
+	uint32_t current = tree_nodes[slices_tree].right;
 	if (current) {
 		while (true) {
 			int64_t x = p_x - slices[tree_nodes[current].element].x;
 			if (x < 0) {
-				if (tree_nodes[current].current.left) {
-					current = tree_nodes[current].current.left;
+				if (tree_nodes[current].left) {
+					current = tree_nodes[current].left;
 					continue;
 				}
-				insert_after = tree_nodes[current].current.prev;
+				insert_after = tree_nodes[current].prev;
 				break;
 			}
 			if (x > 0) {
-				if (tree_nodes[current].current.right) {
-					current = tree_nodes[current].current.right;
+				if (tree_nodes[current].right) {
+					current = tree_nodes[current].right;
 					continue;
 				}
 				insert_after = current;
@@ -589,31 +250,37 @@ uint32_t BentleyOttmann::add_slice(int64_t p_x) {
 	}
 	Slice slice;
 	slice.x = p_x;
-	slice.points_tree = tree_create();
 	slice.vertical_tree = tree_create();
-	slice.check_list = list_create();
-	tree_insert<true>(tree_create(slices.size()), insert_after);
+	tree_insert(tree_create(slices.size()), insert_after);
 	slices.push_back(slice);
 	return slices.size() - 1;
 }
 
-uint32_t BentleyOttmann::add_point(uint32_t p_slice, int64_t p_y) {
-	uint32_t insert_after = slices[p_slice].points_tree;
-	uint32_t current = tree_nodes[slices[p_slice].points_tree].current.right;
+uint32_t BentleyOttmann::add_point(int64_t p_x, int64_t p_y, int64_t p_factor) {
+	DEV_ASSERT(p_factor > 0 && p_factor < 0x100000000000LL);
+	if (p_factor > 1 && (p_x % p_factor) == 0 && (p_y % p_factor) == 0) {
+		// Factor 1 offers a faster path for some operations, since no-overflow is guaranteed
+		// Try to optimize only to 1. Optimizing to 2 or more is pointless
+		p_x /= p_factor;
+		p_y /= p_factor;
+		p_factor = 1;
+	}
+	uint32_t insert_after = points_tree;
+	uint32_t current = tree_nodes[points_tree].right;
 	if (current) {
 		while (true) {
-			int64_t y = p_y - points[tree_nodes[current].element].y;
-			if (y < 0) {
-				if (tree_nodes[current].current.left) {
-					current = tree_nodes[current].current.left;
+			int cmp = cmp_point_point(p_x, p_y, p_factor, tree_nodes[current].element);
+			if (cmp < 0) {
+				if (tree_nodes[current].left) {
+					current = tree_nodes[current].left;
 					continue;
 				}
-				insert_after = tree_nodes[current].current.prev;
+				insert_after = tree_nodes[current].prev;
 				break;
 			}
-			if (y > 0) {
-				if (tree_nodes[current].current.right) {
-					current = tree_nodes[current].current.right;
+			if (cmp > 0) {
+				if (tree_nodes[current].right) {
+					current = tree_nodes[current].right;
 					continue;
 				}
 				insert_after = current;
@@ -623,107 +290,74 @@ uint32_t BentleyOttmann::add_point(uint32_t p_slice, int64_t p_y) {
 		}
 	}
 	Point point;
-	point.slice = p_slice;
-	point.x = slices[p_slice].x;
+	point.x = p_x;
 	point.y = p_y;
-	point.incoming_tree = tree_create();
+	point.factor = p_factor;
 	point.outgoing_tree = tree_create();
-	tree_insert<true>(tree_create(points.size()), insert_after);
+	point.listnode_edge_prev = list_create(points.size());
+	point.listnode_edge_next = list_create(points.size());
+	tree_insert(tree_create(points.size()), insert_after);
 	points.push_back(point);
 	return points.size() - 1;
 }
 
-uint32_t BentleyOttmann::get_point_before_edge(uint32_t p_slice, uint32_t p_edge, bool p_next_x) {
-	uint32_t current = tree_nodes[slices[p_slice].points_tree].current.right;
+void BentleyOttmann::point_add_outgoing(uint32_t p_point, uint32_t p_edge) {
+retry:
+	DEV_ASSERT(tree_nodes[edges[p_edge].treenode_outgoing].parent == 0);
+	uint32_t current = tree_nodes[points[p_point].outgoing_tree].right;
 	if (!current) {
-		return slices[p_slice].points_tree;
-	}
-	const Edge &edge = edges[p_edge];
-	int64_t x = slices[p_slice].x;
-	if (p_next_x) {
-		x++;
+		tree_insert(edges[p_edge].treenode_outgoing, points[p_point].outgoing_tree);
+		return;
 	}
 	while (true) {
-		int64_t cross = points[tree_nodes[current].element].y * edge.dir_x - x * edge.dir_y - edge.cross;
-		if (cross > 0) {
-			if (tree_nodes[current].current.left) {
-				current = tree_nodes[current].current.left;
+		uint32_t point = edges[tree_nodes[current].element].point_end;
+		int64_t cmp = points[point].x * edges[p_edge].dir_y - points[point].y * edges[p_edge].dir_x + edges[p_edge].cross;
+		if (cmp < 0) {
+			if (tree_nodes[current].left) {
+				current = tree_nodes[current].left;
 				continue;
 			}
-			return tree_nodes[current].current.prev;
+			tree_insert(edges[p_edge].treenode_outgoing, tree_nodes[current].prev);
+			return;
 		}
-		if (cross < 0 && tree_nodes[current].current.right) {
-			current = tree_nodes[current].current.right;
-			continue;
-		}
-		return current;
-	}
-}
-
-bool BentleyOttmann::is_point_on_edge(uint32_t p_point, uint32_t p_edge, bool p_next_x) {
-	const Edge &edge = edges[p_edge];
-	int64_t x = points[p_point].x;
-	if (p_next_x) {
-		x++;
-	}
-	int64_t mod = (points[p_point].y * edge.dir_x - x * edge.dir_y - edge.cross) << 1;
-	return mod <= edge.dir_x && mod + edge.dir_x > 0;
-}
-
-uint32_t BentleyOttmann::point_get_incoming_before(uint32_t p_point, uint32_t p_index) {
-	uint32_t current = tree_nodes[points[p_point].incoming_tree].current.right;
-	if (!current) {
-		return points[p_point].incoming_tree;
-	}
-	while (true) {
-		uint32_t index = tree_nodes[edges[tree_nodes[current].element].treenode_edges].previous.index;
-		if (p_index > index) {
-			if (tree_nodes[current].current.right) {
-				current = tree_nodes[current].current.right;
+		if (cmp > 0) {
+			if (tree_nodes[current].right) {
+				current = tree_nodes[current].right;
 				continue;
 			}
-			return current;
+			tree_insert(edges[p_edge].treenode_outgoing, current);
+			return;
 		}
-		if (p_index < index && tree_nodes[current].current.left) {
-			current = tree_nodes[current].current.left;
-			continue;
-		}
-		return tree_nodes[current].current.prev;
-	}
-}
-
-uint32_t BentleyOttmann::point_get_outgoing_before(uint32_t p_point, uint32_t p_index) {
-	uint32_t current = tree_nodes[points[p_point].outgoing_tree].current.right;
-	if (!current) {
-		return points[p_point].outgoing_tree;
-	}
-	while (true) {
-		uint32_t index = tree_nodes[edges[tree_nodes[current].element].treenode_edges].current.index;
-		if (p_index > index) {
-			if (tree_nodes[current].current.right) {
-				current = tree_nodes[current].current.right;
-				continue;
+		uint32_t point_end = edges[p_edge].point_end;
+		if (points[point_end].x >= points[point].x) {
+			edges[tree_nodes[current].element].winding += edges[p_edge].winding;
+			if (points[point_end].x == points[point].x) {
+				DEV_ASSERT(points[point_end].y == points[point].y);
+				return;
 			}
-			return current;
+			p_point = point;
+			edges[p_edge].point_outgoing = p_point;
+			goto retry;
 		}
-		if (p_index < index && tree_nodes[current].current.left) {
-			current = tree_nodes[current].current.left;
-			continue;
-		}
-		return tree_nodes[current].current.prev;
+		tree_replace(edges[p_edge].treenode_outgoing, current);
+		edges[p_edge].winding += edges[tree_nodes[current].element].winding;
+		p_edge = tree_nodes[current].element;
+		p_point = point_end;
+		edges[p_edge].point_outgoing = p_point;
+		goto retry;
 	}
 }
 
 void BentleyOttmann::add_edge(uint32_t p_point_start, uint32_t p_point_end, int p_winding) {
+	DEV_ASSERT(points[p_point_start].factor == 1 && points[p_point_end].factor == 1);
 	Edge edge;
 	edge.point_start = edge.point_outgoing = p_point_start;
 	edge.point_end = p_point_end;
-	edge.treenode_edges = tree_create(edges.size(), p_winding);
-	edge.treenode_incoming = tree_create(edges.size());
+	edge.winding = p_winding;
+	edge.treenode_edges = tree_create(edges.size());
 	edge.treenode_outgoing = tree_create(edges.size());
-	edge.listnode_incoming = list_create(edges.size());
-	edge.listnode_outgoing = list_create(edges.size());
-	edge.listnode_check = list_create(edges.size());
+	edge.points_prev_list = list_create();
+	edge.points_next_list = list_create();
 	edge.dir_x = points[p_point_end].x - points[p_point_start].x;
 	edge.dir_y = points[p_point_end].y - points[p_point_start].y;
 	if (edge.dir_y >= 0) {
@@ -734,28 +368,27 @@ void BentleyOttmann::add_edge(uint32_t p_point_start, uint32_t p_point_end, int 
 		edge.max_y = points[p_point_start].y;
 	}
 	DEV_ASSERT(edge.dir_x > 0);
-	edge.next_check = points[p_point_start].slice;
 	edge.cross = points[p_point_start].y * edge.dir_x - points[p_point_start].x * edge.dir_y;
 	edges.push_back(edge);
-	list_insert(edge.listnode_check, slices[points[p_point_start].slice].check_list);
+	point_add_outgoing(p_point_start, edges.size() - 1);
 }
 
 void BentleyOttmann::add_vertical_edge(uint32_t p_slice, int64_t p_y_start, int64_t p_y_end) {
 	uint32_t start;
-	uint32_t current = tree_nodes[slices[p_slice].vertical_tree].current.right;
+	uint32_t current = tree_nodes[slices[p_slice].vertical_tree].right;
 	if (!current) {
 		Vertical vertical;
 		vertical.y = p_y_start;
 		vertical.is_start = true;
 		start = tree_create(verticals.size());
 		verticals.push_back(vertical);
-		tree_insert<true>(start, slices[p_slice].vertical_tree);
+		tree_insert(start, slices[p_slice].vertical_tree);
 	} else {
 		while (true) {
 			int64_t y = p_y_start - verticals[tree_nodes[current].element].y;
 			if (y < 0) {
-				if (tree_nodes[current].current.left) {
-					current = tree_nodes[current].current.left;
+				if (tree_nodes[current].left) {
+					current = tree_nodes[current].left;
 					continue;
 				}
 				if (verticals[tree_nodes[current].element].is_start) {
@@ -764,15 +397,15 @@ void BentleyOttmann::add_vertical_edge(uint32_t p_slice, int64_t p_y_start, int6
 					vertical.is_start = true;
 					start = tree_create(verticals.size());
 					verticals.push_back(vertical);
-					tree_insert<true>(start, tree_nodes[current].current.prev);
+					tree_insert(start, tree_nodes[current].prev);
 				} else {
-					start = tree_nodes[current].current.prev;
+					start = tree_nodes[current].prev;
 				}
 				break;
 			}
 			if (y > 0) {
-				if (tree_nodes[current].current.right) {
-					current = tree_nodes[current].current.right;
+				if (tree_nodes[current].right) {
+					current = tree_nodes[current].right;
 					continue;
 				}
 				if (!verticals[tree_nodes[current].element].is_start) {
@@ -781,7 +414,7 @@ void BentleyOttmann::add_vertical_edge(uint32_t p_slice, int64_t p_y_start, int6
 					vertical.is_start = true;
 					start = tree_create(verticals.size());
 					verticals.push_back(vertical);
-					tree_insert<true>(start, current);
+					tree_insert(start, current);
 				} else {
 					start = current;
 				}
@@ -790,61 +423,146 @@ void BentleyOttmann::add_vertical_edge(uint32_t p_slice, int64_t p_y_start, int6
 			if (verticals[tree_nodes[current].element].is_start) {
 				start = current;
 			} else {
-				start = tree_nodes[current].current.prev;
+				start = tree_nodes[current].prev;
 			}
 			break;
 		}
 	}
-	while (tree_nodes[start].current.next != slices[p_slice].vertical_tree) {
-		int64_t y = p_y_end - verticals[tree_nodes[tree_nodes[start].current.next].element].y;
-		if (y < 0 || (y == 0 && !verticals[tree_nodes[tree_nodes[start].current.next].element].is_start)) {
+	while (tree_nodes[start].next != slices[p_slice].vertical_tree) {
+		int64_t y = p_y_end - verticals[tree_nodes[tree_nodes[start].next].element].y;
+		if (y < 0 || (y == 0 && !verticals[tree_nodes[tree_nodes[start].next].element].is_start)) {
 			break;
 		}
-		tree_remove<true>(tree_nodes[start].current.next);
+		tree_remove(tree_nodes[start].next);
 	}
-	if (tree_nodes[start].current.next == slices[p_slice].vertical_tree || verticals[tree_nodes[tree_nodes[start].current.next].element].is_start) {
+	if (tree_nodes[start].next == slices[p_slice].vertical_tree || verticals[tree_nodes[tree_nodes[start].next].element].is_start) {
 		Vertical vertical;
 		vertical.y = p_y_end;
 		vertical.is_start = false;
-		tree_insert<true>(tree_create(verticals.size()), start);
+		tree_insert(tree_create(verticals.size()), start);
 		verticals.push_back(vertical);
 	}
 }
 
-int64_t BentleyOttmann::edge_intersect_x(uint32_t p_edge, int64_t p_x) {
+void BentleyOttmann::edge_intersect_x(uint32_t p_edge, int64_t p_x) {
 	const Edge &edge = edges[p_edge];
+	if (points[edge.point_end].x <= p_x) {
+		return;
+	}
 	int64_t total = p_x * edge.dir_y + edge.cross;
-	int64_t y = total / edge.dir_x;
-	int64_t mod = total % edge.dir_x;
-	if (mod < 0) {
-		mod += edge.dir_x;
-		y--;
-	}
-	if ((mod << 1) >= edge.dir_x) {
-		y++;
-	}
-	return y;
+	add_point(p_x * edge.dir_x, total, edge.dir_x);
 }
 
-int64_t BentleyOttmann::edge_intersect_edge(uint32_t p_edge1, uint32_t p_edge2) {
+void BentleyOttmann::edge_intersect_edge(uint32_t p_edge1, uint32_t p_edge2) {
 	const Edge &edge1 = edges[p_edge1];
 	const Edge &edge2 = edges[p_edge2];
-	int64_t total = edge2.cross * edge1.dir_y - edge1.cross * edge2.dir_y;
+	int64_t total_x = edge2.cross * edge1.dir_x - edge1.cross * edge2.dir_x;
+	int64_t total_y = edge2.cross * edge1.dir_y - edge1.cross * edge2.dir_y;
 	int64_t factor = edge1.dir_y * edge2.dir_x - edge2.dir_y * edge1.dir_x;
-	int64_t y = total / factor;
-	int64_t mod = total % factor;
-	if (mod < 0) {
-		mod += factor;
-		y--;
+	add_point(total_x, total_y, factor);
+	DEV_ASSERT(cmp_point_edge(add_point(total_x, total_y, factor), p_edge1) == 0 && cmp_point_edge(add_point(total_x, total_y, factor), p_edge2) == 0);
+}
+
+void BentleyOttmann::edge_set_outgoing(uint32_t p_edge, uint32_t p_point) {
+	if ((edges[p_edge].winding_total - edges[p_edge].winding) & winding_mask) {
+		uint32_t next = list_nodes[edges[p_edge].points_prev_list].next;
+		if (next != edges[p_edge].points_prev_list) {
+			uint32_t next_next = list_nodes[next].next;
+			while (next_next != edges[p_edge].points_prev_list) {
+				triangles.push_back(p_point);
+				triangles.push_back(list_nodes[next_next].element);
+				triangles.push_back(list_nodes[next].element);
+				list_remove(next);
+				next = next_next;
+				next_next = list_nodes[next].next;
+			}
+			triangles.push_back(p_point);
+			triangles.push_back(edges[p_edge].point_outgoing);
+			triangles.push_back(list_nodes[next].element);
+			list_remove(next);
+		}
 	}
-	if ((mod << 1) >= factor) {
-		y++;
+	if (edges[p_edge].winding_total & winding_mask) {
+		uint32_t next = list_nodes[edges[p_edge].points_next_list].next;
+		if (next != edges[p_edge].points_next_list) {
+			uint32_t next_next = list_nodes[next].next;
+			while (next_next != edges[p_edge].points_next_list) {
+				triangles.push_back(p_point);
+				triangles.push_back(list_nodes[next].element);
+				triangles.push_back(list_nodes[next_next].element);
+				list_remove(next);
+				next = next_next;
+				next_next = list_nodes[next].next;
+			}
+			triangles.push_back(p_point);
+			triangles.push_back(list_nodes[next].element);
+			triangles.push_back(edges[p_edge].point_outgoing);
+			list_remove(next);
+		}
 	}
-	return y;
+	edges[p_edge].point_outgoing = p_point;
+}
+
+void BentleyOttmann::edge_add_point_before(uint32_t p_edge, uint32_t p_point) {
+	if (!((edges[p_edge].winding_total - edges[p_edge].winding) & winding_mask)) {
+		return;
+	}
+	uint32_t next = list_nodes[edges[p_edge].points_prev_list].next;
+	if (next != edges[p_edge].points_prev_list) {
+		uint32_t next_next = list_nodes[next].next;
+		while (next_next != edges[p_edge].points_prev_list) {
+			if (cmp_cross(list_nodes[next].element, list_nodes[next_next].element, p_point) <= 0) {
+				goto done;
+			}
+			triangles.push_back(p_point);
+			triangles.push_back(list_nodes[next_next].element);
+			triangles.push_back(list_nodes[next].element);
+			list_remove(next);
+			next = next_next;
+			next_next = list_nodes[next].next;
+		}
+		if (cmp_cross(list_nodes[next].element, edges[p_edge].point_outgoing, p_point) > 0) {
+			triangles.push_back(p_point);
+			triangles.push_back(edges[p_edge].point_outgoing);
+			triangles.push_back(list_nodes[next].element);
+			list_remove(next);
+		}
+	}
+done:
+	list_insert(points[p_point].listnode_edge_prev, edges[p_edge].points_prev_list);
+}
+
+void BentleyOttmann::edge_add_point_after(uint32_t p_edge, uint32_t p_point) {
+	if (!(edges[p_edge].winding_total & winding_mask)) {
+		return;
+	}
+	uint32_t next = list_nodes[edges[p_edge].points_next_list].next;
+	if (next != edges[p_edge].points_next_list) {
+		uint32_t next_next = list_nodes[next].next;
+		while (next_next != edges[p_edge].points_next_list) {
+			if (cmp_cross(list_nodes[next].element, list_nodes[next_next].element, p_point) >= 0) {
+				goto done;
+			}
+			triangles.push_back(p_point);
+			triangles.push_back(list_nodes[next].element);
+			triangles.push_back(list_nodes[next_next].element);
+			list_remove(next);
+			next = next_next;
+			next_next = list_nodes[next].next;
+		}
+		if (cmp_cross(list_nodes[next].element, edges[p_edge].point_outgoing, p_point) < 0) {
+			triangles.push_back(p_point);
+			triangles.push_back(list_nodes[next].element);
+			triangles.push_back(edges[p_edge].point_outgoing);
+			list_remove(next);
+		}
+	}
+done:
+	list_insert(points[p_point].listnode_edge_next, edges[p_edge].points_next_list);
 }
 
 uint32_t BentleyOttmann::get_edge_before(int64_t p_x, int64_t p_y) {
-	uint32_t current = tree_nodes[edges_tree].current.right;
+	uint32_t current = tree_nodes[edges_tree].right;
 	if (!current) {
 		return edges_tree;
 	}
@@ -852,643 +570,678 @@ uint32_t BentleyOttmann::get_edge_before(int64_t p_x, int64_t p_y) {
 		const Edge &edge = edges[tree_nodes[current].element];
 		int64_t cross = p_y * edge.dir_x - p_x * edge.dir_y - edge.cross;
 		if (cross > 0) {
-			if (tree_nodes[current].current.right) {
-				current = tree_nodes[current].current.right;
+			if (tree_nodes[current].right) {
+				current = tree_nodes[current].right;
 				continue;
 			}
 			return current;
 		}
-		if (cross < 0 && tree_nodes[current].current.left) {
-			current = tree_nodes[current].current.left;
+		if (tree_nodes[current].left) {
+			current = tree_nodes[current].left;
 			continue;
 		}
-		return tree_nodes[current].current.prev;
+		return tree_nodes[current].prev;
 	}
 }
 
-uint32_t BentleyOttmann::get_edge_before_end(int64_t p_x, int64_t p_y, int64_t p_end_x, int64_t p_end_y) {
-	uint32_t current = tree_nodes[edges_tree].current.right;
-	if (!current) {
-		return edges_tree;
-	}
-	int64_t a_x = p_end_x - p_x;
-	int64_t a_y = p_end_y - p_y;
-	while (true) {
-		const Edge &edge = edges[tree_nodes[current].element];
-		int64_t cross = p_y * edge.dir_x - p_x * edge.dir_y - edge.cross;
-		if (cross > 0) {
-			if (tree_nodes[current].current.right) {
-				current = tree_nodes[current].current.right;
-				continue;
-			}
-			return current;
-		}
-		if (cross < 0) {
-			if (tree_nodes[current].current.left) {
-				current = tree_nodes[current].current.left;
-				continue;
-			}
-			return tree_nodes[current].current.prev;
-		}
-		// This is a best-effort attempt, since edges are not guaranteed
-		// to be sorted by end.
-		cross = a_y * (points[edges[tree_nodes[current].element].point_end].x - p_x) - a_x * (points[edges[tree_nodes[current].element].point_end].y - p_y);
-		if (cross > 0) {
-			if (tree_nodes[current].current.right) {
-				current = tree_nodes[current].current.right;
-				continue;
-			}
-			return current;
-		}
-		if (cross < 0 && tree_nodes[current].current.left) {
-			current = tree_nodes[current].current.left;
-			continue;
-		}
-		return tree_nodes[current].current.prev;
-	}
-}
-
-uint32_t BentleyOttmann::get_edge_before_previous(uint32_t p_slice, int64_t p_y) {
-	uint32_t current;
-	if (tree_nodes[edges_tree].version == p_slice) {
-		current = tree_nodes[edges_tree].previous.right;
-	} else {
-		current = tree_nodes[edges_tree].current.right;
-	}
+uint32_t BentleyOttmann::get_edge_before_point(uint32_t p_point) {
+	uint32_t current = tree_nodes[edges_tree].right;
 	if (!current) {
 		return edges_tree;
 	}
 	while (true) {
-		const Edge &edge = edges[tree_nodes[current].element];
-		int64_t cross = p_y * edge.dir_x - slices[p_slice].x * edge.dir_y - edge.cross;
-		if (cross > 0) {
-			if (tree_nodes[current].version == p_slice) {
-				if (tree_nodes[current].previous.right) {
-					current = tree_nodes[current].previous.right;
-					continue;
-				}
-			} else {
-				if (tree_nodes[current].current.right) {
-					current = tree_nodes[current].current.right;
-					continue;
-				}
+		int cmp = cmp_point_edge(p_point, tree_nodes[current].element);
+		if (cmp > 0) {
+			if (tree_nodes[current].right) {
+				current = tree_nodes[current].right;
+				continue;
 			}
 			return current;
 		}
-		if (tree_nodes[current].version == p_slice) {
-			if (cross < 0 && tree_nodes[current].previous.left) {
-				current = tree_nodes[current].previous.left;
-				continue;
-			}
-			return tree_nodes[current].previous.prev;
-		} else {
-			if (cross < 0 && tree_nodes[current].current.left) {
-				current = tree_nodes[current].current.left;
-				continue;
-			}
-			return tree_nodes[current].current.prev;
+		if (tree_nodes[current].left) {
+			current = tree_nodes[current].left;
+			continue;
 		}
+		return tree_nodes[current].prev;
 	}
-}
-
-int BentleyOttmann::edge_get_winding_previous(uint32_t p_treenode_edge, uint32_t p_version) {
-	int winding = tree_nodes[p_treenode_edge].self_value;
-	uint32_t current = p_treenode_edge;
-	uint32_t parent;
-	if (tree_nodes[p_treenode_edge].version == p_version) {
-		parent = tree_nodes[p_treenode_edge].previous.parent;
-		if (tree_nodes[tree_nodes[p_treenode_edge].previous.left].version == p_version) {
-			winding += tree_nodes[tree_nodes[p_treenode_edge].previous.left].previous.sum_value;
-		} else {
-			winding += tree_nodes[tree_nodes[p_treenode_edge].previous.left].current.sum_value;
-		}
-	} else {
-		parent = tree_nodes[p_treenode_edge].current.parent;
-		if (tree_nodes[tree_nodes[p_treenode_edge].current.left].version == p_version) {
-			winding += tree_nodes[tree_nodes[p_treenode_edge].current.left].previous.sum_value;
-		} else {
-			winding += tree_nodes[tree_nodes[p_treenode_edge].current.left].current.sum_value;
-		}
-	}
-	while (parent) {
-		if (tree_nodes[parent].version == p_version) {
-			if (tree_nodes[parent].previous.right == current) {
-				if (tree_nodes[tree_nodes[parent].previous.left].version == p_version) {
-					winding += tree_nodes[tree_nodes[parent].previous.left].previous.sum_value + tree_nodes[parent].self_value;
-				} else {
-					winding += tree_nodes[tree_nodes[parent].previous.left].current.sum_value + tree_nodes[parent].self_value;
-				}
-			}
-			current = parent;
-			parent = tree_nodes[current].previous.parent;
-		} else {
-			if (tree_nodes[parent].current.right == current) {
-				if (tree_nodes[tree_nodes[parent].current.left].version == p_version) {
-					winding += tree_nodes[tree_nodes[parent].current.left].previous.sum_value + tree_nodes[parent].self_value;
-				} else {
-					winding += tree_nodes[tree_nodes[parent].current.left].current.sum_value + tree_nodes[parent].self_value;
-				}
-			}
-			current = parent;
-			parent = tree_nodes[current].current.parent;
-		}
-	}
-	return winding;
 }
 
 void BentleyOttmann::check_intersection(uint32_t p_treenode_edge) {
-	DEV_ASSERT(p_treenode_edge != edges_tree && tree_nodes[p_treenode_edge].current.next != edges_tree);
+	DEV_ASSERT(p_treenode_edge != edges_tree && tree_nodes[p_treenode_edge].next != edges_tree);
 	Edge &edge1 = edges[tree_nodes[p_treenode_edge].element];
-	Edge &edge2 = edges[tree_nodes[tree_nodes[p_treenode_edge].current.next].element];
-	if (edge1.max_y < edge2.min_y || edge1.point_start == edge2.point_start) {
+	Edge &edge2 = edges[tree_nodes[tree_nodes[p_treenode_edge].next].element];
+	if (edge1.max_y < edge2.min_y || edge1.point_start == edge2.point_start || edge1.point_end == edge2.point_end) {
 		return;
 	}
 	int64_t max;
-	if (slices[edge1.next_check].x < slices[edge2.next_check].x) {
-		max = slices[edge1.next_check].x;
+	if (points[edge1.point_end].x < points[edge2.point_end].x) {
+		max = points[edge1.point_end].x;
 	} else {
-		max = slices[edge2.next_check].x;
+		max = points[edge2.point_end].x;
 	}
 	if ((max * edge2.dir_y + edge2.cross) * edge1.dir_x >= (max * edge1.dir_y + edge1.cross) * edge2.dir_x) {
 		return;
 	}
-	int64_t total = edge2.cross * edge1.dir_x - edge1.cross * edge2.dir_x;
-	int64_t factor = edge1.dir_y * edge2.dir_x - edge2.dir_y * edge1.dir_x;
-	int64_t x = total / factor;
-	int64_t mod = total % factor;
-	// The intersection must be rounded down, to ensure the edges are still
-	// in the same y-order before they are swapped
-	if (mod < 0) {
-		mod += factor;
-		x--;
+	edge_intersect_edge(tree_nodes[p_treenode_edge].element, tree_nodes[tree_nodes[p_treenode_edge].next].element);
+}
+
+int BentleyOttmann::cmp_point_point(int64_t p_x, int64_t p_y, int64_t p_factor, uint32_t p_point) {
+	if (p_factor == 1) {
+		int64_t cmp = p_x * points[p_point].factor - points[p_point].x;
+		if (cmp > 0) {
+			return 1;
+		}
+		if (cmp < 0) {
+			return -1;
+		}
+		cmp = p_y * points[p_point].factor - points[p_point].y;
+		if (cmp > 0) {
+			return 1;
+		}
+		if (cmp < 0) {
+			return -1;
+		}
+		return 0;
 	}
-	edge1.next_check = add_slice(x);
-	list_insert(edge1.listnode_check, slices[edge1.next_check].check_list);
+	if (points[p_point].factor == 1) {
+		int64_t cmp = p_x - points[p_point].x * p_factor;
+		if (cmp > 0) {
+			return 1;
+		}
+		if (cmp < 0) {
+			return -1;
+		}
+		cmp = p_y - points[p_point].y * p_factor;
+		if (cmp > 0) {
+			return 1;
+		}
+		if (cmp < 0) {
+			return -1;
+		}
+		return 0;
+	}
+	int64_t factor1_lo = p_factor & 0xFFFFFF;
+	int64_t factor1_hi = p_factor >> 24;
+	int64_t factor2_lo = points[p_point].factor & 0xFFFFFF;
+	int64_t factor2_hi = points[p_point].factor >> 24;
+	int64_t v1_lo, v1_hi, v2_lo, v2_hi, m1_lo, m1_hi, m2_lo, m2_hi;
+	int64_t m1_t1, m1_t2, m1_t3, m2_t1, m2_t2, m2_t3;
+	v1_lo = p_x & 0xFFFFFFFF;
+	v1_hi = p_x >> 32;
+	v2_lo = points[p_point].x & 0xFFFFFFFF;
+	v2_hi = points[p_point].x >> 32;
+	// m1 = x1 * factor2
+	// m2 = x2 * factor1
+	m1_t1 = factor2_lo * v1_lo;
+	m2_t1 = factor1_lo * v2_lo;
+	m1_t2 = factor2_hi * v1_lo + (m1_t1 >> 24);
+	m2_t2 = factor1_hi * v2_lo + (m2_t1 >> 24);
+	m1_t3 = factor2_lo * v1_hi + (m1_t2 >> 8);
+	m2_t3 = factor1_lo * v2_hi + (m2_t2 >> 8);
+	m1_hi = factor2_hi * v1_hi + (m1_t3 >> 24);
+	m2_hi = factor1_hi * v2_hi + (m2_t3 >> 24);
+	m1_lo = (m1_t1 & 0xFFFFFF) | ((m1_t2 & 0xFF) << 24) | ((m1_t3 & 0xFFFFFF) << 32);
+	m2_lo = (m2_t1 & 0xFFFFFF) | ((m2_t2 & 0xFF) << 24) | ((m2_t3 & 0xFFFFFF) << 32);
+	// sign(m1 - m2)
+	if (m1_hi > m2_hi) {
+		return 1;
+	}
+	if (m1_hi < m2_hi) {
+		return -1;
+	}
+	if (m1_lo > m2_lo) {
+		return 1;
+	}
+	if (m1_lo < m2_lo) {
+		return -1;
+	}
+	v1_lo = p_y & 0xFFFFFFFF;
+	v1_hi = p_y >> 32;
+	v2_lo = points[p_point].y & 0xFFFFFFFF;
+	v2_hi = points[p_point].y >> 32;
+	// m1 = y1 * factor2
+	// m2 = y2 * factor1
+	m1_t1 = factor2_lo * v1_lo;
+	m2_t1 = factor1_lo * v2_lo;
+	m1_t2 = factor2_hi * v1_lo + (m1_t1 >> 24);
+	m2_t2 = factor1_hi * v2_lo + (m2_t1 >> 24);
+	m1_t3 = factor2_lo * v1_hi + (m1_t2 >> 8);
+	m2_t3 = factor1_lo * v2_hi + (m2_t2 >> 8);
+	m1_hi = factor2_hi * v1_hi + (m1_t3 >> 24);
+	m2_hi = factor1_hi * v2_hi + (m2_t3 >> 24);
+	m1_lo = (m1_t1 & 0xFFFFFF) | ((m1_t2 & 0xFF) << 24) | ((m1_t3 & 0xFFFFFF) << 32);
+	m2_lo = (m2_t1 & 0xFFFFFF) | ((m2_t2 & 0xFF) << 24) | ((m2_t3 & 0xFFFFFF) << 32);
+	// sign(m1 - m2)
+	if (m1_hi > m2_hi) {
+		return 1;
+	}
+	if (m1_hi < m2_hi) {
+		return -1;
+	}
+	if (m1_lo > m2_lo) {
+		return 1;
+	}
+	if (m1_lo < m2_lo) {
+		return -1;
+	}
+	return 0;
 }
 
-uint32_t BentleyOttmann::tree_create(uint32_t p_element, int p_value) {
+int BentleyOttmann::cmp_point_edge(uint32_t p_point, uint32_t p_edge) {
+	if (points[p_point].factor == 1) {
+		int64_t cmp = points[p_point].y * edges[p_edge].dir_x - points[p_point].x * edges[p_edge].dir_y - edges[p_edge].cross;
+		if (cmp > 0) {
+			return 1;
+		}
+		if (cmp < 0) {
+			return -1;
+		}
+		return 0;
+	}
+	int64_t m1_lo, m1_hi, m2_lo, m2_hi, m3_lo, m3_hi;
+	int64_t v_lo, v_hi;
+	int64_t v1_lo, v1_hi, v2_lo, v2_hi, t1, t2, t3;
+	v_lo = points[p_point].y & 0xFFFFFFFF;
+	v_hi = points[p_point].y >> 32;
+	v_lo *= edges[p_edge].dir_x;
+	v_hi = v_hi * edges[p_edge].dir_x + (v_lo >> 32);
+	m1_lo = (v_lo & 0xFFFFFFFF) | ((v_hi & 0xFFFFFFF) << 32);
+	m1_hi = v_hi >> 28;
+	v_lo = points[p_point].x & 0xFFFFFFFF;
+	v_hi = points[p_point].x >> 32;
+	v_lo *= edges[p_edge].dir_y;
+	v_hi = v_hi * edges[p_edge].dir_y + (v_lo >> 32);
+	m2_lo = (v_lo & 0xFFFFFFFF) | ((v_hi & 0xFFFFFFF) << 32);
+	m2_hi = v_hi >> 28;
+	v1_lo = points[p_point].factor & 0xFFFFFF;
+	v1_hi = points[p_point].factor >> 24;
+	v2_lo = edges[p_edge].cross & 0xFFFFFF;
+	v2_hi = edges[p_edge].cross >> 24;
+	t1 = v1_lo * v2_lo;
+	t2 = v1_lo * v2_hi + v1_hi * v2_lo + (t1 >> 24);
+	t3 = v1_hi * v2_hi + (t2 >> 24);
+	m3_lo = (t1 & 0xFFFFFF) | ((t2 & 0xFFFFFF) << 24) | ((t3 & 0xFFF) << 48);
+	m3_hi = t3 >> 12;
+	m2_lo += m3_lo;
+	m2_hi += m3_hi + (m2_lo >> 60);
+	m2_lo &= 0xFFFFFFFFFFFFFFF;
+	if (m1_hi > m2_hi) {
+		return 1;
+	}
+	if (m1_hi < m2_hi) {
+		return -1;
+	}
+	if (m1_lo > m2_lo) {
+		return 1;
+	}
+	if (m1_lo < m2_lo) {
+		return -1;
+	}
+	return 0;
+}
+
+int BentleyOttmann::cmp_cross(uint32_t p_point1, uint32_t p_point2, uint32_t p_point_rel) {
+	if (points[p_point1].factor == 1 && points[p_point2].factor == 1 && points[p_point_rel].factor == 1) {
+		int64_t cmp = (points[p_point1].y - points[p_point_rel].y) * (points[p_point2].x - points[p_point_rel].x) - (points[p_point1].x - points[p_point_rel].x) * (points[p_point2].y - points[p_point_rel].y);
+		if (cmp > 0) {
+			return 1;
+		}
+		if (cmp < 0) {
+			return -1;
+		}
+		return 0;
+	}
+
+	int64_t factor1_lo = points[p_point1].factor & 0xFFFFFF;
+	int64_t factor1_hi = points[p_point1].factor >> 24;
+	int64_t factor2_lo = points[p_point2].factor & 0xFFFFFF;
+	int64_t factor2_hi = points[p_point2].factor >> 24;
+	int64_t factor_rel_lo = points[p_point_rel].factor & 0xFFFFFF;
+	int64_t factor_rel_hi = points[p_point_rel].factor >> 24;
+	int64_t x1_lo = points[p_point1].x & 0xFFFFFFFF;
+	int64_t x1_hi = points[p_point1].x >> 32;
+	int64_t x2_lo = points[p_point2].x & 0xFFFFFFFF;
+	int64_t x2_hi = points[p_point2].x >> 32;
+	int64_t x_rel_lo = (-points[p_point_rel].x) & 0xFFFFFFFF;
+	int64_t x_rel_hi = (-points[p_point_rel].x) >> 32;
+	int64_t y1_lo = points[p_point1].y & 0xFFFFFFFF;
+	int64_t y1_hi = points[p_point1].y >> 32;
+	int64_t y2_lo = points[p_point2].y & 0xFFFFFFFF;
+	int64_t y2_hi = points[p_point2].y >> 32;
+	int64_t y_rel_lo = (-points[p_point_rel].y) & 0xFFFFFFFF;
+	int64_t y_rel_hi = (-points[p_point_rel].y) >> 32;
+
+	// m1 = point1 * factor_rel - point_rel * factor1
+	// m2 = point2 * factor_rel - point_rel * factor2
+	int64_t mx1_t0 = x1_lo * factor_rel_lo + x_rel_lo * factor1_lo;
+	int64_t my1_t0 = y1_lo * factor_rel_lo + y_rel_lo * factor1_lo;
+	int64_t mx2_t0 = x2_lo * factor_rel_lo + x_rel_lo * factor2_lo;
+	int64_t my2_t0 = y2_lo * factor_rel_lo + y_rel_lo * factor2_lo;
+	int64_t mx1_t1 = x1_lo * factor_rel_hi + x_rel_lo * factor1_hi + (mx1_t0 >> 24);
+	int64_t my1_t1 = y1_lo * factor_rel_hi + y_rel_lo * factor1_hi + (my1_t0 >> 24);
+	int64_t mx2_t1 = x2_lo * factor_rel_hi + x_rel_lo * factor2_hi + (mx2_t0 >> 24);
+	int64_t my2_t1 = y2_lo * factor_rel_hi + y_rel_lo * factor2_hi + (my2_t0 >> 24);
+	int64_t mx1_t2 = x1_hi * factor_rel_lo + x_rel_hi * factor1_lo + (mx1_t1 >> 8);
+	int64_t my1_t2 = y1_hi * factor_rel_lo + y_rel_hi * factor1_lo + (my1_t1 >> 8);
+	int64_t mx2_t2 = x2_hi * factor_rel_lo + x_rel_hi * factor2_lo + (mx2_t1 >> 8);
+	int64_t my2_t2 = y2_hi * factor_rel_lo + y_rel_hi * factor2_lo + (my2_t1 >> 8);
+	int64_t mx1_t3 = x1_hi * factor_rel_hi + x_rel_hi * factor1_hi + (mx1_t2 >> 24);
+	int64_t my1_t3 = y1_hi * factor_rel_hi + y_rel_hi * factor1_hi + (my1_t2 >> 24);
+	int64_t mx2_t3 = x2_hi * factor_rel_hi + x_rel_hi * factor2_hi + (mx2_t2 >> 24);
+	int64_t my2_t3 = y2_hi * factor_rel_hi + y_rel_hi * factor2_hi + (my2_t2 >> 24);
+	int64_t mx1_0 = (mx1_t0 & 0xFFFFFF) | ((mx1_t1 & 0x1F) << 24);
+	int64_t my1_0 = (my1_t0 & 0xFFFFFF) | ((my1_t1 & 0x1F) << 24);
+	int64_t mx2_0 = (mx2_t0 & 0xFFFFFF) | ((mx2_t1 & 0x1F) << 24);
+	int64_t my2_0 = (my2_t0 & 0xFFFFFF) | ((my2_t1 & 0x1F) << 24);
+	int64_t mx1_1 = ((mx1_t1 >> 5) & 0x7) | ((mx1_t2 & 0xFFFFFF) << 3) | ((mx1_t3 & 0x3) << 27);
+	int64_t my1_1 = ((my1_t1 >> 5) & 0x7) | ((my1_t2 & 0xFFFFFF) << 3) | ((my1_t3 & 0x3) << 27);
+	int64_t mx2_1 = ((mx2_t1 >> 5) & 0x7) | ((mx2_t2 & 0xFFFFFF) << 3) | ((mx2_t3 & 0x3) << 27);
+	int64_t my2_1 = ((my2_t1 >> 5) & 0x7) | ((my2_t2 & 0xFFFFFF) << 3) | ((my2_t3 & 0x3) << 27);
+	int64_t mx1_2 = (mx1_t3 >> 2) & 0x1FFFFFFF;
+	int64_t my1_2 = (my1_t3 >> 2) & 0x1FFFFFFF;
+	int64_t mx2_2 = (mx2_t3 >> 2) & 0x1FFFFFFF;
+	int64_t my2_2 = (my2_t3 >> 2) & 0x1FFFFFFF;
+	int64_t mx1_3 = mx1_t3 >> 31;
+	int64_t my1_3 = my1_t3 >> 31;
+	int64_t mx2_3 = mx2_t3 >> 31;
+	int64_t my2_3 = my2_t3 >> 31;
+
+	// a = m1.y * m2.x
+	// b = m1.x * m2.y
+	int64_t a_0 = my1_0 * mx2_0;
+	int64_t b_0 = mx1_0 * my2_0;
+	int64_t a_1 = my1_1 * mx2_0 + my1_0 * mx2_1 + (a_0 >> 29);
+	int64_t b_1 = mx1_1 * my2_0 + mx1_0 * my2_1 + (b_0 >> 29);
+	int64_t a_2 = my1_2 * mx2_0 + my1_1 * mx2_1 + my1_0 * mx2_2 + (a_1 >> 29);
+	int64_t b_2 = mx1_2 * my2_0 + mx1_1 * my2_1 + mx1_0 * my2_2 + (b_1 >> 29);
+	int64_t a_3 = my1_3 * mx2_0 + my1_2 * mx2_1 + my1_1 * mx2_2 + my1_0 * mx2_3 + (a_2 >> 29);
+	int64_t b_3 = mx1_3 * my2_0 + mx1_2 * my2_1 + mx1_1 * my2_2 + mx1_0 * my2_3 + (b_2 >> 29);
+	int64_t a_4 = my1_3 * mx2_1 + my1_2 * mx2_2 + my1_1 * mx2_3 + (a_3 >> 29);
+	int64_t b_4 = mx1_3 * my2_1 + mx1_2 * my2_2 + mx1_1 * my2_3 + (b_3 >> 29);
+	int64_t a_5 = my1_3 * mx2_2 + my1_2 * mx2_3 + (a_4 >> 29);
+	int64_t b_5 = mx1_3 * my2_2 + mx1_2 * my2_3 + (b_4 >> 29);
+	int64_t a_6 = my1_3 * mx2_3 + (a_5 >> 29);
+	int64_t b_6 = mx1_3 * my2_3 + (b_5 >> 29);
+
+	a_0 &= 0x1FFFFFFF;
+	b_0 &= 0x1FFFFFFF;
+	a_1 &= 0x1FFFFFFF;
+	b_1 &= 0x1FFFFFFF;
+	a_2 &= 0x1FFFFFFF;
+	b_2 &= 0x1FFFFFFF;
+	a_3 &= 0x1FFFFFFF;
+	b_3 &= 0x1FFFFFFF;
+	a_4 &= 0x1FFFFFFF;
+	b_4 &= 0x1FFFFFFF;
+	a_5 &= 0x1FFFFFFF;
+	b_5 &= 0x1FFFFFFF;
+
+	// sign(a - b)
+	if (a_6 > b_6) {
+		return 1;
+	}
+	if (a_6 < b_6) {
+		return -1;
+	}
+	if (a_5 > b_5) {
+		return 1;
+	}
+	if (a_5 < b_5) {
+		return -1;
+	}
+	if (a_4 > b_4) {
+		return 1;
+	}
+	if (a_4 < b_4) {
+		return -1;
+	}
+	if (a_3 > b_3) {
+		return 1;
+	}
+	if (a_3 < b_3) {
+		return -1;
+	}
+	if (a_2 > b_2) {
+		return 1;
+	}
+	if (a_2 < b_2) {
+		return -1;
+	}
+	if (a_1 > b_1) {
+		return 1;
+	}
+	if (a_1 < b_1) {
+		return -1;
+	}
+	if (a_0 > b_0) {
+		return 1;
+	}
+	if (a_0 < b_0) {
+		return -1;
+	}
+	return 0;
+}
+
+uint32_t BentleyOttmann::tree_create(uint32_t p_element) {
 	TreeNode node;
-	node.previous.prev = node.previous.next = node.current.prev = node.current.next = tree_nodes.size();
+	node.prev = node.next = tree_nodes.size();
 	node.element = p_element;
-	node.self_value = p_value;
 	tree_nodes.push_back(node);
-	return node.current.next;
+	return node.next;
 }
 
-template <bool simple>
-void BentleyOttmann::tree_clear(uint32_t p_tree, uint32_t p_version) {
-	uint32_t iter = tree_nodes[p_tree].current.next;
+void BentleyOttmann::tree_clear(uint32_t p_tree) {
+	uint32_t iter = tree_nodes[p_tree].next;
 	while (iter != p_tree) {
-		uint32_t next = tree_nodes[iter].current.next;
-		tree_version<simple>(iter, p_version);
-		tree_nodes[iter].current.left = tree_nodes[iter].current.right = tree_nodes[iter].current.parent = 0;
-		tree_nodes[iter].current.prev = tree_nodes[iter].current.next = iter;
-		tree_nodes[iter].current.is_heavy = false;
-		tree_nodes[iter].current.sum_value = 0;
-		tree_nodes[iter].current.size = 0;
+		uint32_t next = tree_nodes[iter].next;
+		tree_nodes[iter].left = tree_nodes[iter].right = tree_nodes[iter].parent = 0;
+		tree_nodes[iter].prev = tree_nodes[iter].next = iter;
+		tree_nodes[iter].is_heavy = false;
 		iter = next;
 	}
-	tree_version<simple>(p_tree, p_version);
-	tree_nodes[p_tree].current.left = tree_nodes[p_tree].current.right = tree_nodes[p_tree].current.parent = 0;
-	tree_nodes[p_tree].current.prev = tree_nodes[p_tree].current.next = iter;
-	tree_nodes[p_tree].current.is_heavy = false;
-	tree_nodes[p_tree].current.sum_value = 0;
-	tree_nodes[p_tree].current.size = 0;
+	tree_nodes[p_tree].left = tree_nodes[p_tree].right = tree_nodes[p_tree].parent = 0;
+	tree_nodes[p_tree].prev = tree_nodes[p_tree].next = iter;
+	tree_nodes[p_tree].is_heavy = false;
 }
 
-template <bool simple>
-void BentleyOttmann::tree_insert(uint32_t p_insert_item, uint32_t p_insert_after, uint32_t p_version) {
+void BentleyOttmann::tree_insert(uint32_t p_insert_item, uint32_t p_insert_after) {
 	DEV_ASSERT(p_insert_item != 0 && p_insert_after != 0);
-	tree_version<simple>(p_insert_item, p_version);
-	tree_version<simple>(p_insert_after, p_version);
-	tree_version<simple>(tree_nodes[p_insert_after].current.next, p_version);
-	if (tree_nodes[p_insert_after].current.right == 0) {
-		tree_nodes[p_insert_after].current.right = p_insert_item;
-		tree_nodes[p_insert_item].current.parent = p_insert_after;
+	if (tree_nodes[p_insert_after].right == 0) {
+		tree_nodes[p_insert_after].right = p_insert_item;
+		tree_nodes[p_insert_item].parent = p_insert_after;
 	} else {
-		DEV_ASSERT(tree_nodes[tree_nodes[p_insert_after].current.next].current.left == 0);
-		tree_nodes[tree_nodes[p_insert_after].current.next].current.left = p_insert_item;
-		tree_nodes[p_insert_item].current.parent = tree_nodes[p_insert_after].current.next;
+		DEV_ASSERT(tree_nodes[tree_nodes[p_insert_after].next].left == 0);
+		tree_nodes[tree_nodes[p_insert_after].next].left = p_insert_item;
+		tree_nodes[p_insert_item].parent = tree_nodes[p_insert_after].next;
 	}
-	tree_nodes[p_insert_item].current.prev = p_insert_after;
-	tree_nodes[p_insert_item].current.next = tree_nodes[p_insert_after].current.next;
-	tree_nodes[tree_nodes[p_insert_after].current.next].current.prev = p_insert_item;
-	tree_nodes[p_insert_after].current.next = p_insert_item;
-	DEV_ASSERT(tree_nodes[p_insert_item].current.sum_value == 0);
+	tree_nodes[p_insert_item].prev = p_insert_after;
+	tree_nodes[p_insert_item].next = tree_nodes[p_insert_after].next;
+	tree_nodes[tree_nodes[p_insert_after].next].prev = p_insert_item;
+	tree_nodes[p_insert_after].next = p_insert_item;
 	uint32_t item = p_insert_item;
-	if constexpr (!simple) {
-		while (item) {
-			tree_version<simple>(item, p_version);
-			tree_nodes[item].current.sum_value += tree_nodes[p_insert_item].self_value;
-			tree_nodes[item].current.size++;
-			item = tree_nodes[item].current.parent;
-		}
-	}
-	item = p_insert_item;
-	uint32_t parent = tree_nodes[item].current.parent;
-	while (tree_nodes[parent].current.parent) {
-		uint32_t sibling = tree_nodes[parent].current.left;
+	uint32_t parent = tree_nodes[item].parent;
+	while (tree_nodes[parent].parent) {
+		uint32_t sibling = tree_nodes[parent].left;
 		if (sibling == item) {
-			sibling = tree_nodes[parent].current.right;
+			sibling = tree_nodes[parent].right;
 		}
-		if (tree_nodes[sibling].current.is_heavy) {
-			tree_version<simple>(sibling, p_version);
-			tree_nodes[sibling].current.is_heavy = false;
+		if (tree_nodes[sibling].is_heavy) {
+			tree_nodes[sibling].is_heavy = false;
 			return;
 		}
-		if (!tree_nodes[item].current.is_heavy) {
-			tree_version<simple>(item, p_version);
-			tree_nodes[item].current.is_heavy = true;
+		if (!tree_nodes[item].is_heavy) {
+			tree_nodes[item].is_heavy = true;
 			item = parent;
-			parent = tree_nodes[item].current.parent;
+			parent = tree_nodes[item].parent;
 			continue;
 		}
 		uint32_t move;
 		uint32_t unmove;
 		uint32_t move_move;
 		uint32_t move_unmove;
-		if (item == tree_nodes[parent].current.left) {
-			move = tree_nodes[item].current.right;
-			unmove = tree_nodes[item].current.left;
-			move_move = tree_nodes[move].current.left;
-			move_unmove = tree_nodes[move].current.right;
+		if (item == tree_nodes[parent].left) {
+			move = tree_nodes[item].right;
+			unmove = tree_nodes[item].left;
+			move_move = tree_nodes[move].left;
+			move_unmove = tree_nodes[move].right;
 		} else {
-			move = tree_nodes[item].current.left;
-			unmove = tree_nodes[item].current.right;
-			move_move = tree_nodes[move].current.right;
-			move_unmove = tree_nodes[move].current.left;
+			move = tree_nodes[item].left;
+			unmove = tree_nodes[item].right;
+			move_move = tree_nodes[move].right;
+			move_unmove = tree_nodes[move].left;
 		}
-		if (!tree_nodes[move].current.is_heavy) {
-			tree_version<simple>(parent, p_version);
-			tree_rotate<simple>(item, p_version);
-			tree_nodes[item].current.is_heavy = tree_nodes[parent].current.is_heavy;
-			tree_nodes[parent].current.is_heavy = !tree_nodes[unmove].current.is_heavy;
-			if (tree_nodes[unmove].current.is_heavy) {
-				tree_version<simple>(unmove, p_version);
-				tree_nodes[unmove].current.is_heavy = false;
+		if (!tree_nodes[move].is_heavy) {
+			tree_rotate(item);
+			tree_nodes[item].is_heavy = tree_nodes[parent].is_heavy;
+			tree_nodes[parent].is_heavy = !tree_nodes[unmove].is_heavy;
+			if (tree_nodes[unmove].is_heavy) {
+				tree_nodes[unmove].is_heavy = false;
 				return;
 			}
 			DEV_ASSERT(move != 0);
-			tree_version<simple>(move, p_version);
-			tree_nodes[move].current.is_heavy = true;
-			parent = tree_nodes[item].current.parent;
+			tree_nodes[move].is_heavy = true;
+			parent = tree_nodes[item].parent;
 			continue;
 		}
-		tree_rotate<simple>(move, p_version);
-		tree_rotate<simple>(move, p_version);
-		tree_nodes[move].current.is_heavy = tree_nodes[parent].current.is_heavy;
+		tree_rotate(move);
+		tree_rotate(move);
+		tree_nodes[move].is_heavy = tree_nodes[parent].is_heavy;
 		if (unmove != 0) {
-			tree_version<simple>(unmove, p_version);
-			tree_nodes[unmove].current.is_heavy = tree_nodes[move_unmove].current.is_heavy;
+			tree_nodes[unmove].is_heavy = tree_nodes[move_unmove].is_heavy;
 		}
 		if (sibling != 0) {
-			tree_version<simple>(sibling, p_version);
-			tree_nodes[sibling].current.is_heavy = tree_nodes[move_move].current.is_heavy;
+			tree_nodes[sibling].is_heavy = tree_nodes[move_move].is_heavy;
 		}
-		tree_nodes[item].current.is_heavy = false;
-		tree_nodes[parent].current.is_heavy = false;
-		tree_nodes[move_move].current.is_heavy = false;
+		tree_nodes[item].is_heavy = false;
+		tree_nodes[parent].is_heavy = false;
+		tree_nodes[move_move].is_heavy = false;
 		if (move_unmove != 0) {
-			tree_version<simple>(move_unmove, p_version);
-			tree_nodes[move_unmove].current.is_heavy = false;
+			tree_nodes[move_unmove].is_heavy = false;
 		}
 		return;
 	}
 }
 
-template <bool simple>
-void BentleyOttmann::tree_remove(uint32_t p_remove_item, uint32_t p_version) {
-	DEV_ASSERT(tree_nodes[p_remove_item].current.parent != 0);
-	if (tree_nodes[p_remove_item].current.left != 0 && tree_nodes[p_remove_item].current.right != 0) {
-		uint32_t prev = tree_nodes[p_remove_item].current.prev;
-		DEV_ASSERT(tree_nodes[prev].current.parent != 0 && tree_nodes[prev].current.right == 0);
-		tree_swap<simple>(p_remove_item, prev, p_version);
+void BentleyOttmann::tree_remove(uint32_t p_remove_item) {
+	DEV_ASSERT(tree_nodes[p_remove_item].parent != 0);
+	if (tree_nodes[p_remove_item].left != 0 && tree_nodes[p_remove_item].right != 0) {
+		uint32_t prev = tree_nodes[p_remove_item].prev;
+		DEV_ASSERT(tree_nodes[prev].parent != 0 && tree_nodes[prev].right == 0);
+		tree_swap(p_remove_item, prev);
 	}
-	DEV_ASSERT(tree_nodes[p_remove_item].current.left == 0 || tree_nodes[p_remove_item].current.right == 0);
-	uint32_t prev = tree_nodes[p_remove_item].current.prev;
-	uint32_t next = tree_nodes[p_remove_item].current.next;
-	tree_version<simple>(prev, p_version);
-	tree_version<simple>(next, p_version);
-	tree_nodes[prev].current.next = next;
-	tree_nodes[next].current.prev = prev;
-	uint32_t parent = tree_nodes[p_remove_item].current.parent;
-	uint32_t replacement = tree_nodes[p_remove_item].current.left;
+	DEV_ASSERT(tree_nodes[p_remove_item].left == 0 || tree_nodes[p_remove_item].right == 0);
+	uint32_t prev = tree_nodes[p_remove_item].prev;
+	uint32_t next = tree_nodes[p_remove_item].next;
+	tree_nodes[prev].next = next;
+	tree_nodes[next].prev = prev;
+	uint32_t parent = tree_nodes[p_remove_item].parent;
+	uint32_t replacement = tree_nodes[p_remove_item].left;
 	if (replacement == 0) {
-		replacement = tree_nodes[p_remove_item].current.right;
+		replacement = tree_nodes[p_remove_item].right;
 	}
 	if (replacement != 0) {
-		tree_version<simple>(replacement, p_version);
-		tree_nodes[replacement].current.parent = parent;
-		tree_nodes[replacement].current.is_heavy = tree_nodes[p_remove_item].current.is_heavy;
+		tree_nodes[replacement].parent = parent;
+		tree_nodes[replacement].is_heavy = tree_nodes[p_remove_item].is_heavy;
 	}
-	tree_version<simple>(parent, p_version);
-	if (tree_nodes[parent].current.left == p_remove_item) {
-		tree_nodes[parent].current.left = replacement;
+	if (tree_nodes[parent].left == p_remove_item) {
+		tree_nodes[parent].left = replacement;
 	} else {
-		tree_nodes[parent].current.right = replacement;
+		tree_nodes[parent].right = replacement;
 	}
-	tree_version<simple>(p_remove_item, p_version);
-	tree_nodes[p_remove_item].current.left = tree_nodes[p_remove_item].current.right = tree_nodes[p_remove_item].current.parent = 0;
-	tree_nodes[p_remove_item].current.prev = tree_nodes[p_remove_item].current.next = p_remove_item;
-	tree_nodes[p_remove_item].current.is_heavy = false;
-	uint32_t item = parent;
-	if constexpr (!simple) {
-		tree_nodes[p_remove_item].current.sum_value = 0;
-		tree_nodes[p_remove_item].current.size = 0;
-		while (item) {
-			tree_version<simple>(item, p_version);
-			tree_nodes[item].current.sum_value -= tree_nodes[p_remove_item].self_value;
-			tree_nodes[item].current.size--;
-			item = tree_nodes[item].current.parent;
-		}
-	}
-	item = replacement;
-	if (tree_nodes[parent].current.left == 0 && tree_nodes[parent].current.right == 0) {
+	tree_nodes[p_remove_item].left = tree_nodes[p_remove_item].right = tree_nodes[p_remove_item].parent = 0;
+	tree_nodes[p_remove_item].prev = tree_nodes[p_remove_item].next = p_remove_item;
+	tree_nodes[p_remove_item].is_heavy = false;
+	uint32_t item = replacement;
+	if (tree_nodes[parent].left == 0 && tree_nodes[parent].right == 0) {
 		item = parent;
-		parent = tree_nodes[item].current.parent;
+		parent = tree_nodes[item].parent;
 	}
-	while (tree_nodes[parent].current.parent != 0) {
-		uint32_t sibling = tree_nodes[parent].current.left;
+	while (tree_nodes[parent].parent != 0) {
+		uint32_t sibling = tree_nodes[parent].left;
 		if (sibling == item) {
-			sibling = tree_nodes[parent].current.right;
+			sibling = tree_nodes[parent].right;
 		}
 		DEV_ASSERT(sibling != 0);
-		if (tree_nodes[item].current.is_heavy) {
-			tree_version<simple>(item, p_version);
-			tree_nodes[item].current.is_heavy = false;
+		if (tree_nodes[item].is_heavy) {
+			tree_nodes[item].is_heavy = false;
 			item = parent;
-			parent = tree_nodes[item].current.parent;
+			parent = tree_nodes[item].parent;
 			continue;
 		}
-		if (!tree_nodes[sibling].current.is_heavy) {
-			tree_version<simple>(sibling, p_version);
-			tree_nodes[sibling].current.is_heavy = true;
+		if (!tree_nodes[sibling].is_heavy) {
+			tree_nodes[sibling].is_heavy = true;
 			return;
 		}
 		uint32_t move;
 		uint32_t unmove;
 		uint32_t move_move;
 		uint32_t move_unmove;
-		if (sibling == tree_nodes[parent].current.left) {
-			move = tree_nodes[sibling].current.right;
-			unmove = tree_nodes[sibling].current.left;
-			move_move = tree_nodes[move].current.left;
-			move_unmove = tree_nodes[move].current.right;
+		if (sibling == tree_nodes[parent].left) {
+			move = tree_nodes[sibling].right;
+			unmove = tree_nodes[sibling].left;
+			move_move = tree_nodes[move].left;
+			move_unmove = tree_nodes[move].right;
 		} else {
-			move = tree_nodes[sibling].current.left;
-			unmove = tree_nodes[sibling].current.right;
-			move_move = tree_nodes[move].current.right;
-			move_unmove = tree_nodes[move].current.left;
+			move = tree_nodes[sibling].left;
+			unmove = tree_nodes[sibling].right;
+			move_move = tree_nodes[move].right;
+			move_unmove = tree_nodes[move].left;
 		}
-		if (!tree_nodes[move].current.is_heavy) {
-			tree_version<simple>(parent, p_version);
-			tree_rotate<simple>(sibling, p_version);
-			tree_nodes[sibling].current.is_heavy = tree_nodes[parent].current.is_heavy;
-			tree_nodes[parent].current.is_heavy = !tree_nodes[unmove].current.is_heavy;
-			if (tree_nodes[unmove].current.is_heavy) {
-				tree_version<simple>(unmove, p_version);
-				tree_nodes[unmove].current.is_heavy = false;
+		if (!tree_nodes[move].is_heavy) {
+			tree_rotate(sibling);
+			tree_nodes[sibling].is_heavy = tree_nodes[parent].is_heavy;
+			tree_nodes[parent].is_heavy = !tree_nodes[unmove].is_heavy;
+			if (tree_nodes[unmove].is_heavy) {
+				tree_nodes[unmove].is_heavy = false;
 				item = sibling;
-				parent = tree_nodes[item].current.parent;
+				parent = tree_nodes[item].parent;
 				continue;
 			}
 			DEV_ASSERT(move != 0);
-			tree_version<simple>(move, p_version);
-			tree_nodes[move].current.is_heavy = true;
+			tree_nodes[move].is_heavy = true;
 			return;
 		}
-		tree_rotate<simple>(move, p_version);
-		tree_rotate<simple>(move, p_version);
-		tree_nodes[move].current.is_heavy = tree_nodes[parent].current.is_heavy;
+		tree_rotate(move);
+		tree_rotate(move);
+		tree_nodes[move].is_heavy = tree_nodes[parent].is_heavy;
 		if (unmove != 0) {
-			tree_version<simple>(unmove, p_version);
-			tree_nodes[unmove].current.is_heavy = tree_nodes[move_unmove].current.is_heavy;
+			tree_nodes[unmove].is_heavy = tree_nodes[move_unmove].is_heavy;
 		}
 		if (item != 0) {
-			tree_version<simple>(item, p_version);
-			tree_nodes[item].current.is_heavy = tree_nodes[move_move].current.is_heavy;
+			tree_nodes[item].is_heavy = tree_nodes[move_move].is_heavy;
 		}
-		tree_nodes[sibling].current.is_heavy = false;
-		tree_nodes[parent].current.is_heavy = false;
-		tree_nodes[move_move].current.is_heavy = false;
+		tree_nodes[sibling].is_heavy = false;
+		tree_nodes[parent].is_heavy = false;
+		tree_nodes[move_move].is_heavy = false;
 		if (move_unmove != 0) {
-			tree_version<simple>(move_unmove, p_version);
-			tree_nodes[move_unmove].current.is_heavy = false;
+			tree_nodes[move_unmove].is_heavy = false;
 		}
 		item = move;
-		parent = tree_nodes[item].current.parent;
+		parent = tree_nodes[item].parent;
 		continue;
 	}
 }
 
-template <bool simple>
-void BentleyOttmann::tree_rotate(uint32_t p_item, uint32_t p_version) {
-	DEV_ASSERT(tree_nodes[tree_nodes[p_item].current.parent].current.parent != 0);
-	uint32_t parent = tree_nodes[p_item].current.parent;
-	tree_version<simple>(p_item, p_version);
-	tree_version<simple>(parent, p_version);
-	if (tree_nodes[parent].current.left == p_item) {
-		uint32_t move = tree_nodes[p_item].current.right;
-		tree_nodes[parent].current.left = move;
-		tree_nodes[p_item].current.right = parent;
+void BentleyOttmann::tree_rotate(uint32_t p_item) {
+	DEV_ASSERT(tree_nodes[tree_nodes[p_item].parent].parent != 0);
+	uint32_t parent = tree_nodes[p_item].parent;
+	if (tree_nodes[parent].left == p_item) {
+		uint32_t move = tree_nodes[p_item].right;
+		tree_nodes[parent].left = move;
+		tree_nodes[p_item].right = parent;
 		if (move) {
-			tree_version<simple>(move, p_version);
-			tree_nodes[move].current.parent = parent;
+			tree_nodes[move].parent = parent;
 		}
 	} else {
-		uint32_t move = tree_nodes[p_item].current.left;
-		tree_nodes[parent].current.right = move;
-		tree_nodes[p_item].current.left = parent;
+		uint32_t move = tree_nodes[p_item].left;
+		tree_nodes[parent].right = move;
+		tree_nodes[p_item].left = parent;
 		if (move) {
-			tree_version<simple>(move, p_version);
-			tree_nodes[move].current.parent = parent;
+			tree_nodes[move].parent = parent;
 		}
 	}
-	uint32_t grandparent = tree_nodes[parent].current.parent;
-	tree_version<simple>(grandparent, p_version);
-	tree_nodes[p_item].current.parent = grandparent;
-	if (tree_nodes[grandparent].current.left == parent) {
-		tree_nodes[grandparent].current.left = p_item;
+	uint32_t grandparent = tree_nodes[parent].parent;
+	tree_nodes[p_item].parent = grandparent;
+	if (tree_nodes[grandparent].left == parent) {
+		tree_nodes[grandparent].left = p_item;
 	} else {
-		tree_nodes[grandparent].current.right = p_item;
+		tree_nodes[grandparent].right = p_item;
 	}
-	tree_nodes[parent].current.parent = p_item;
-	if constexpr (!simple) {
-		tree_nodes[parent].current.sum_value = tree_nodes[parent].self_value + tree_nodes[tree_nodes[parent].current.left].current.sum_value + tree_nodes[tree_nodes[parent].current.right].current.sum_value;
-		tree_nodes[p_item].current.sum_value = tree_nodes[p_item].self_value + tree_nodes[tree_nodes[p_item].current.left].current.sum_value + tree_nodes[tree_nodes[p_item].current.right].current.sum_value;
-		tree_nodes[parent].current.size = tree_nodes[tree_nodes[parent].current.left].current.size + tree_nodes[tree_nodes[parent].current.right].current.size + 1;
-		tree_nodes[p_item].current.size = tree_nodes[tree_nodes[p_item].current.left].current.size + tree_nodes[tree_nodes[p_item].current.right].current.size + 1;
-	}
+	tree_nodes[parent].parent = p_item;
 }
 
-template <bool simple>
-void BentleyOttmann::tree_swap(uint32_t p_item1, uint32_t p_item2, uint32_t p_version) {
-	DEV_ASSERT(tree_nodes[p_item1].current.parent != 0 && tree_nodes[p_item2].current.parent != 0);
-	tree_version<simple>(p_item1, p_version);
-	tree_version<simple>(p_item2, p_version);
-	uint32_t parent1 = tree_nodes[p_item1].current.parent;
-	uint32_t left1 = tree_nodes[p_item1].current.left;
-	uint32_t right1 = tree_nodes[p_item1].current.right;
-	uint32_t prev1 = tree_nodes[p_item1].current.prev;
-	uint32_t next1 = tree_nodes[p_item1].current.next;
-	uint32_t parent2 = tree_nodes[p_item2].current.parent;
-	uint32_t left2 = tree_nodes[p_item2].current.left;
-	uint32_t right2 = tree_nodes[p_item2].current.right;
-	uint32_t prev2 = tree_nodes[p_item2].current.prev;
-	uint32_t next2 = tree_nodes[p_item2].current.next;
-	tree_version<simple>(parent1, p_version);
-	tree_version<simple>(prev1, p_version);
-	tree_version<simple>(next1, p_version);
-	tree_version<simple>(parent2, p_version);
-	tree_version<simple>(prev2, p_version);
-	tree_version<simple>(next2, p_version);
-	if (tree_nodes[parent1].current.left == p_item1) {
-		tree_nodes[parent1].current.left = p_item2;
+void BentleyOttmann::tree_swap(uint32_t p_item1, uint32_t p_item2) {
+	DEV_ASSERT(tree_nodes[p_item1].parent != 0 && tree_nodes[p_item2].parent != 0);
+	uint32_t parent1 = tree_nodes[p_item1].parent;
+	uint32_t left1 = tree_nodes[p_item1].left;
+	uint32_t right1 = tree_nodes[p_item1].right;
+	uint32_t prev1 = tree_nodes[p_item1].prev;
+	uint32_t next1 = tree_nodes[p_item1].next;
+	uint32_t parent2 = tree_nodes[p_item2].parent;
+	uint32_t left2 = tree_nodes[p_item2].left;
+	uint32_t right2 = tree_nodes[p_item2].right;
+	uint32_t prev2 = tree_nodes[p_item2].prev;
+	uint32_t next2 = tree_nodes[p_item2].next;
+	if (tree_nodes[parent1].left == p_item1) {
+		tree_nodes[parent1].left = p_item2;
 	} else {
-		tree_nodes[parent1].current.right = p_item2;
+		tree_nodes[parent1].right = p_item2;
 	}
-	if (tree_nodes[parent2].current.left == p_item2) {
-		tree_nodes[parent2].current.left = p_item1;
+	if (tree_nodes[parent2].left == p_item2) {
+		tree_nodes[parent2].left = p_item1;
 	} else {
-		tree_nodes[parent2].current.right = p_item1;
+		tree_nodes[parent2].right = p_item1;
 	}
 	if (left1) {
-		tree_version<simple>(left1, p_version);
-		tree_nodes[left1].current.parent = p_item2;
+		tree_nodes[left1].parent = p_item2;
 	}
 	if (right1) {
-		tree_version<simple>(right1, p_version);
-		tree_nodes[right1].current.parent = p_item2;
+		tree_nodes[right1].parent = p_item2;
 	}
 	if (left2) {
-		tree_version<simple>(left2, p_version);
-		tree_nodes[left2].current.parent = p_item1;
+		tree_nodes[left2].parent = p_item1;
 	}
 	if (right2) {
-		tree_version<simple>(right2, p_version);
-		tree_nodes[right2].current.parent = p_item1;
+		tree_nodes[right2].parent = p_item1;
 	}
-	tree_nodes[prev1].current.next = p_item2;
-	tree_nodes[next1].current.prev = p_item2;
-	tree_nodes[prev2].current.next = p_item1;
-	tree_nodes[next2].current.prev = p_item1;
-	parent1 = tree_nodes[p_item1].current.parent;
-	left1 = tree_nodes[p_item1].current.left;
-	right1 = tree_nodes[p_item1].current.right;
-	prev1 = tree_nodes[p_item1].current.prev;
-	next1 = tree_nodes[p_item1].current.next;
-	parent2 = tree_nodes[p_item2].current.parent;
-	left2 = tree_nodes[p_item2].current.left;
-	right2 = tree_nodes[p_item2].current.right;
-	prev2 = tree_nodes[p_item2].current.prev;
-	next2 = tree_nodes[p_item2].current.next;
-	tree_nodes[p_item2].current.parent = parent1;
-	tree_nodes[p_item2].current.left = left1;
-	tree_nodes[p_item2].current.right = right1;
-	tree_nodes[p_item2].current.prev = prev1;
-	tree_nodes[p_item2].current.next = next1;
-	tree_nodes[p_item1].current.parent = parent2;
-	tree_nodes[p_item1].current.left = left2;
-	tree_nodes[p_item1].current.right = right2;
-	tree_nodes[p_item1].current.prev = prev2;
-	tree_nodes[p_item1].current.next = next2;
-	bool is_heavy = tree_nodes[p_item1].current.is_heavy;
-	tree_nodes[p_item1].current.is_heavy = tree_nodes[p_item2].current.is_heavy;
-	tree_nodes[p_item2].current.is_heavy = is_heavy;
-	if constexpr (!simple) {
-		int sum_value = tree_nodes[p_item1].current.sum_value;
-		tree_nodes[p_item1].current.sum_value = tree_nodes[p_item2].current.sum_value;
-		tree_nodes[p_item2].current.sum_value = sum_value;
-		uint32_t size = tree_nodes[p_item1].current.size;
-		tree_nodes[p_item1].current.size = tree_nodes[p_item2].current.size;
-		tree_nodes[p_item2].current.size = size;
-		int diff = tree_nodes[p_item1].self_value - tree_nodes[p_item2].self_value;
-		if (diff) {
-			while (p_item1) {
-				tree_version<simple>(p_item1, p_version);
-				tree_nodes[p_item1].current.sum_value += diff;
-				p_item1 = tree_nodes[p_item1].current.parent;
-			}
-			while (p_item2) {
-				tree_version<simple>(p_item2, p_version);
-				tree_nodes[p_item2].current.sum_value -= diff;
-				p_item2 = tree_nodes[p_item2].current.parent;
-			}
-		}
-	}
+	tree_nodes[prev1].next = p_item2;
+	tree_nodes[next1].prev = p_item2;
+	tree_nodes[prev2].next = p_item1;
+	tree_nodes[next2].prev = p_item1;
+	parent1 = tree_nodes[p_item1].parent;
+	left1 = tree_nodes[p_item1].left;
+	right1 = tree_nodes[p_item1].right;
+	prev1 = tree_nodes[p_item1].prev;
+	next1 = tree_nodes[p_item1].next;
+	parent2 = tree_nodes[p_item2].parent;
+	left2 = tree_nodes[p_item2].left;
+	right2 = tree_nodes[p_item2].right;
+	prev2 = tree_nodes[p_item2].prev;
+	next2 = tree_nodes[p_item2].next;
+	tree_nodes[p_item2].parent = parent1;
+	tree_nodes[p_item2].left = left1;
+	tree_nodes[p_item2].right = right1;
+	tree_nodes[p_item2].prev = prev1;
+	tree_nodes[p_item2].next = next1;
+	tree_nodes[p_item1].parent = parent2;
+	tree_nodes[p_item1].left = left2;
+	tree_nodes[p_item1].right = right2;
+	tree_nodes[p_item1].prev = prev2;
+	tree_nodes[p_item1].next = next2;
+	bool is_heavy = tree_nodes[p_item1].is_heavy;
+	tree_nodes[p_item1].is_heavy = tree_nodes[p_item2].is_heavy;
+	tree_nodes[p_item2].is_heavy = is_heavy;
 }
 
-template <>
-void BentleyOttmann::tree_version<false>(uint32_t p_item, uint32_t p_version) {
-	DEV_ASSERT(p_item != 0);
-	if (tree_nodes[p_item].version == p_version) {
-		return;
-	}
-	tree_nodes[p_item].version = p_version;
-	tree_nodes[p_item].previous = tree_nodes[p_item].current;
-}
-
-template <>
-void BentleyOttmann::tree_version<true>(uint32_t p_item, uint32_t p_version) {
-}
-
-void BentleyOttmann::tree_index(uint32_t p_item) {
-	int index = tree_nodes[tree_nodes[p_item].current.left].current.size;
-	uint32_t current = p_item;
-	uint32_t parent = tree_nodes[current].current.parent;
-	while (parent) {
-		if (tree_nodes[parent].current.right == current) {
-			index += tree_nodes[tree_nodes[parent].current.left].current.size + 1;
-		}
-		current = parent;
-		parent = tree_nodes[current].current.parent;
-	}
-	tree_nodes[p_item].current.index = index;
-}
-
-void BentleyOttmann::tree_index_previous(uint32_t p_item, uint32_t p_version) {
-	int index;
-	uint32_t current = p_item;
-	uint32_t parent;
-	if (tree_nodes[p_item].version == p_version) {
-		parent = tree_nodes[p_item].previous.parent;
-		if (tree_nodes[tree_nodes[p_item].previous.left].version == p_version) {
-			index = tree_nodes[tree_nodes[p_item].previous.left].previous.size;
-		} else {
-			index = tree_nodes[tree_nodes[p_item].previous.left].current.size;
-		}
+void BentleyOttmann::tree_replace(uint32_t p_item1, uint32_t p_item2) {
+	DEV_ASSERT(tree_nodes[p_item1].parent == 0 && tree_nodes[p_item2].parent != 0);
+	uint32_t parent = tree_nodes[p_item2].parent;
+	uint32_t left = tree_nodes[p_item2].left;
+	uint32_t right = tree_nodes[p_item2].right;
+	uint32_t prev = tree_nodes[p_item2].prev;
+	uint32_t next = tree_nodes[p_item2].next;
+	if (tree_nodes[parent].left == p_item2) {
+		tree_nodes[parent].left = p_item1;
 	} else {
-		parent = tree_nodes[p_item].current.parent;
-		if (tree_nodes[tree_nodes[p_item].current.left].version == p_version) {
-			index = tree_nodes[tree_nodes[p_item].current.left].previous.size;
-		} else {
-			index = tree_nodes[tree_nodes[p_item].current.left].current.size;
-		}
+		tree_nodes[parent].right = p_item1;
 	}
-	while (parent) {
-		if (tree_nodes[parent].version == p_version) {
-			if (tree_nodes[parent].previous.right == current) {
-				if (tree_nodes[tree_nodes[parent].previous.left].version == p_version) {
-					index += tree_nodes[tree_nodes[parent].previous.left].previous.size + 1;
-				} else {
-					index += tree_nodes[tree_nodes[parent].previous.left].current.size + 1;
-				}
-			}
-			current = parent;
-			parent = tree_nodes[current].previous.parent;
-		} else {
-			if (tree_nodes[parent].current.right == current) {
-				if (tree_nodes[tree_nodes[parent].current.left].version == p_version) {
-					index += tree_nodes[tree_nodes[parent].current.left].previous.size + 1;
-				} else {
-					index += tree_nodes[tree_nodes[parent].current.left].current.size + 1;
-				}
-			}
-			current = parent;
-			parent = tree_nodes[current].current.parent;
-		}
+	if (left) {
+		tree_nodes[left].parent = p_item1;
 	}
-	tree_nodes[p_item].previous.index = index;
+	if (right) {
+		tree_nodes[right].parent = p_item1;
+	}
+	tree_nodes[prev].next = p_item1;
+	tree_nodes[next].prev = p_item1;
+	tree_nodes[p_item1].parent = parent;
+	tree_nodes[p_item1].left = left;
+	tree_nodes[p_item1].right = right;
+	tree_nodes[p_item1].prev = prev;
+	tree_nodes[p_item1].next = next;
+	tree_nodes[p_item1].is_heavy = tree_nodes[p_item2].is_heavy;
+	tree_nodes[p_item2].left = tree_nodes[p_item2].right = tree_nodes[p_item2].parent = 0;
+	tree_nodes[p_item2].prev = tree_nodes[p_item2].next = p_item2;
+	tree_nodes[p_item2].is_heavy = false;
 }
 
 uint32_t BentleyOttmann::list_create(uint32_t p_element) {
