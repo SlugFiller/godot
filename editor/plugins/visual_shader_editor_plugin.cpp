@@ -5891,6 +5891,7 @@ VisualShaderEditor::VisualShaderEditor() {
 	// CANVASITEM-FOR-ALL
 
 	add_options.push_back(AddOption("Color", "Input/All", "VisualShaderNodeInput", vformat(input_param_shader_modes, "color", "COLOR"), { "color" }, VisualShaderNode::PORT_TYPE_VECTOR_4D, -1, Shader::MODE_CANVAS_ITEM));
+	add_options.push_back(AddOption("Modulate", "Input/All", "VisualShaderNodeInput", vformat(input_param_shader_modes, "modulate", "MODULATE"), { "modulate" }, VisualShaderNode::PORT_TYPE_VECTOR_4D, -1, Shader::MODE_CANVAS_ITEM));
 	add_options.push_back(AddOption("TexturePixelSize", "Input/All", "VisualShaderNodeInput", vformat(input_param_shader_modes, "texture_pixel_size", "TEXTURE_PIXEL_SIZE"), { "texture_pixel_size" }, VisualShaderNode::PORT_TYPE_VECTOR_2D, -1, Shader::MODE_CANVAS_ITEM));
 	add_options.push_back(AddOption("Time", "Input/All", "VisualShaderNodeInput", vformat(input_param_shader_modes, "time", "TIME"), { "time" }, VisualShaderNode::PORT_TYPE_SCALAR, -1, Shader::MODE_CANVAS_ITEM));
 	add_options.push_back(AddOption("UV", "Input/All", "VisualShaderNodeInput", vformat(input_param_shader_modes, "uv", "UV"), { "uv" }, VisualShaderNode::PORT_TYPE_VECTOR_2D, -1, Shader::MODE_CANVAS_ITEM));
